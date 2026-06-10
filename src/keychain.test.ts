@@ -15,20 +15,22 @@ import { pathToFileURL } from "node:url"
 import {
   buildAccountLabels,
   credentialBlobMatches,
+  deriveKeychainDescription,
   keychainSuffixForDir,
   parseCredentials,
+  parseKeychainDump,
   readAllClaudeAccounts as readAllClaudeAccountsReal,
   readCredentialsFile,
   updateCredentialBlob,
   writeBackCredentials,
 } from "./keychain.ts"
 
-// Mirrors listClaudeKeychainServices regex logic for unit testing
 type MockedKeychain = {
   readAllClaudeAccounts: () => Array<{
     label: string
     source: string
     configDir?: string
+    description?: string
     credentials: {
       accessToken: string
       refreshToken: string
@@ -136,25 +138,76 @@ export function __getSecurityWrites() {
   } as MockedKeychain
 }
 
+/**
+ * Build a fixture in the shape `security dump-keychain` actually emits, so
+ * tests exercise the real attribute parser instead of a stand-in.
+ */
+function proBlob(accessToken: string): string {
+  return JSON.stringify({
+    claudeAiOauth: {
+      accessToken,
+      refreshToken: `rt-${accessToken}`,
+      expiresAt: 1_700_000_000_000,
+      subscriptionType: "pro",
+    },
+  })
+}
+
+function dumpAttr(name: string, value: string | undefined): string {
+  return `    "${name}"<blob>=${value === undefined ? "<NULL>" : `"${value}"`}\n`
+}
+
+function genpDump(
+  items: Array<{
+    service: string | null
+    label?: string
+    comment?: string
+    description?: string
+    account?: string
+    class?: string
+  }>,
+): string {
+  return items
+    .map((item) => {
+      const label =
+        item.label === undefined
+          ? item.service === null
+            ? "<NULL>"
+            : `"${item.service}"`
+          : `"${item.label}"`
+      return (
+        `keychain: "/Users/test/Library/Keychains/login.keychain-db"\n` +
+        `version: 512\n` +
+        `class: "${item.class ?? "genp"}"\n` +
+        `attributes:\n` +
+        `    0x00000007 <blob>=${label}\n` +
+        dumpAttr("acct", item.account ?? "testuser") +
+        dumpAttr("desc", item.description) +
+        dumpAttr("icmt", item.comment) +
+        dumpAttr("svce", item.service ?? undefined)
+      )
+    })
+    .join("")
+}
+
+/**
+ * The service list `listClaudeKeychainEntries` would produce for a dump.
+ *
+ * Mirrors only the filter and ordering (that function needs `execSync`); the
+ * parsing underneath is the real implementation.
+ */
 function extractServicesFromDump(output: string): string[] {
   const PRIMARY = "Claude Code-credentials"
-  const services: string[] = []
-  const seen = new Set<string>()
+  const re = /^Claude Code-credentials(?:-[0-9a-f]+)?$/
 
-  const re = /"Claude Code-credentials(?:-[0-9a-f]+)?"/g
-  let m = re.exec(output)
-  while (m !== null) {
-    const svc = m[0].slice(1, -1)
-    if (!seen.has(svc)) {
-      seen.add(svc)
-      services.push(svc)
-    }
-    m = re.exec(output)
+  const seen = new Set<string>()
+  for (const entry of parseKeychainDump(output)) {
+    if (re.test(entry.service)) seen.add(entry.service)
   }
 
   const ordered: string[] = []
   if (seen.has(PRIMARY)) ordered.push(PRIMARY)
-  for (const svc of services) {
+  for (const svc of seen) {
     if (svc !== PRIMARY) ordered.push(svc)
   }
   return ordered
@@ -231,38 +284,93 @@ describe("parseCredentials", () => {
 })
 
 describe("keychain service discovery", () => {
-  it("discovers primary and suffixed services", () => {
-    const dump = `
-    "svce"<blob>="Claude Code-credentials-b28bbb7c"
-    "svce"<blob>="Claude Code-credentials"
-    `
-    assert.deepEqual(extractServicesFromDump(dump), [
-      "Claude Code-credentials",
-      "Claude Code-credentials-b28bbb7c",
-    ])
+  it("discovers primary and suffixed services, primary first", () => {
+    assert.deepEqual(
+      extractServicesFromDump(
+        genpDump([
+          { service: "Claude Code-credentials-b28bbb7c" },
+          { service: "Claude Code-credentials" },
+        ]),
+      ),
+      ["Claude Code-credentials", "Claude Code-credentials-b28bbb7c"],
+    )
   })
 
   it("does not match uppercase or arbitrary suffixes", () => {
     assert.deepEqual(
       extractServicesFromDump(
-        `
-        "svce"<blob>="Claude Code-credentials-B28BBB7C"
-        "svce"<blob>="Claude Code-credentials-myaccount"
-        `,
+        genpDump([
+          { service: "Claude Code-credentials-B28BBB7C" },
+          { service: "Claude Code-credentials-myaccount" },
+        ]),
       ),
       [],
     )
   })
 
   it("discovers legacy hex suffixes that are not exactly 8 chars", () => {
-    const dump = `
-    "svce"<blob>="Claude Code-credentials-abc"
-    "svce"<blob>="Claude Code-credentials-deadbeefcafebabe"
-    `
-    assert.deepEqual(extractServicesFromDump(dump), [
-      "Claude Code-credentials-abc",
-      "Claude Code-credentials-deadbeefcafebabe",
-    ])
+    assert.deepEqual(
+      extractServicesFromDump(
+        genpDump([
+          { service: "Claude Code-credentials-abc" },
+          { service: "Claude Code-credentials-deadbeefcafebabe" },
+        ]),
+      ),
+      [
+        "Claude Code-credentials-abc",
+        "Claude Code-credentials-deadbeefcafebabe",
+      ],
+    )
+  })
+
+  it("ignores non-Claude keychain items", () => {
+    assert.deepEqual(
+      extractServicesFromDump(
+        genpDump([
+          { service: "com.example.Example", label: "Example" },
+          { service: "Claude Code-credentials" },
+        ]),
+      ),
+      ["Claude Code-credentials"],
+    )
+  })
+
+  it("deduplicates repeated services", () => {
+    assert.deepEqual(
+      extractServicesFromDump(
+        genpDump([
+          { service: "Claude Code-credentials-b28bbb7c" },
+          { service: "Claude Code-credentials-b28bbb7c" },
+        ]),
+      ),
+      ["Claude Code-credentials-b28bbb7c"],
+    )
+  })
+
+  it("finds entries whose human label was renamed away from the service", () => {
+    // The 0x00000007 label is user-editable in Keychain Access; discovery must
+    // key off `svce`, which the CLI owns.
+    assert.deepEqual(
+      extractServicesFromDump(
+        genpDump([
+          {
+            service: "Claude Code-credentials-12345678",
+            label: "Jack's work account",
+          },
+        ]),
+      ),
+      ["Claude Code-credentials-12345678"],
+    )
+  })
+
+  it("returns nothing for a dump with no Claude entries", () => {
+    assert.deepEqual(extractServicesFromDump(""), [])
+    assert.deepEqual(
+      extractServicesFromDump(
+        genpDump([{ service: "Claude Code-credentials", class: "inet" }]),
+      ),
+      [],
+    )
   })
 })
 
@@ -342,10 +450,10 @@ describe("readAllClaudeAccounts", () => {
       }),
     )
 
-    const dump = `
-    "svce"<blob>="Claude Code-credentials-${workSuffix}"
-    "svce"<blob>="Claude Code-credentials"
-    `
+    const dump = genpDump([
+      { service: `Claude Code-credentials-${workSuffix}` },
+      { service: "Claude Code-credentials" },
+    ])
     const primaryCreds = JSON.stringify({
       claudeAiOauth: {
         accessToken: "primary-at",
@@ -424,7 +532,7 @@ describe("readAllClaudeAccounts", () => {
 
     try {
       const { readAllClaudeAccounts } = await loadKeychainWithMockedSecurity(
-        `"svce"<blob>="Claude Code-credentials-${workSuffix}"`,
+        genpDump([{ service: `Claude Code-credentials-${workSuffix}` }]),
         {
           [`Claude Code-credentials-${workSuffix}`]: JSON.stringify({
             claudeAiOauth: {
@@ -464,7 +572,7 @@ describe("readAllClaudeAccounts", () => {
 
     try {
       const { readAllClaudeAccounts } = await loadKeychainWithMockedSecurity(
-        `"svce"<blob>="Claude Code-credentials-abc"`,
+        genpDump([{ service: "Claude Code-credentials-abc" }]),
         {
           "Claude Code-credentials-abc": JSON.stringify({
             claudeAiOauth: {
@@ -484,6 +592,60 @@ describe("readAllClaudeAccounts", () => {
       // refresh behaviour these legacy entries had before suffix mapping
       // existed.
       assert.equal(accounts[0].configDir, primaryDir)
+    } finally {
+      if (originalHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = originalHome
+      }
+      rmSync(tempHome, { recursive: true, force: true })
+    }
+  })
+
+  it("labels accounts with the user-set Keychain comment", async () => {
+    const originalHome = process.env.HOME
+    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
+    const primaryDir = join(tempHome, ".claude")
+    const workDir = join(tempHome, ".work")
+    const workSuffix = keychainSuffixForDir(workDir)
+
+    mkdirSync(primaryDir, { recursive: true })
+    mkdirSync(workDir, { recursive: true })
+    writeFileSync(
+      join(primaryDir, ".claude.json"),
+      JSON.stringify({ oauthAccount: { emailAddress: "primary@example.com" } }),
+    )
+    writeFileSync(
+      join(workDir, ".claude.json"),
+      JSON.stringify({ oauthAccount: { emailAddress: "work@example.com" } }),
+    )
+
+    process.env.HOME = tempHome
+
+    try {
+      const { readAllClaudeAccounts } = await loadKeychainWithMockedSecurity(
+        genpDump([
+          { service: "Claude Code-credentials" },
+          {
+            service: `Claude Code-credentials-${workSuffix}`,
+            comment: "Work sub",
+          },
+        ]),
+        {
+          "Claude Code-credentials": proBlob("primary-at"),
+          [`Claude Code-credentials-${workSuffix}`]: proBlob("work-at"),
+        },
+      )
+
+      const accounts = readAllClaudeAccounts()
+      // The commented entry drops the number and the email in favour of the
+      // name the user chose; the uncommented one keeps the generated label.
+      assert.equal(accounts[0].label, "Claude Pro 1: primary@example.com")
+      assert.equal(accounts[0].description, undefined)
+      assert.equal(accounts[1].label, "Claude Pro - Work sub")
+      assert.equal(accounts[1].description, "Work sub")
+      // Descriptions must not disturb config-dir resolution.
+      assert.equal(accounts[1].configDir, workDir)
     } finally {
       if (originalHome === undefined) {
         delete process.env.HOME
@@ -635,6 +797,199 @@ describe("credentialBlobMatches", () => {
       },
     })
     assert.equal(credentialBlobMatches(malformed, "account-a"), false)
+  })
+})
+
+describe("parseKeychainDump", () => {
+  // Mirrors the real format emitted by `security dump-keychain` on macOS.
+  // Includes: a primary Claude entry, a renamed/comment-tagged entry whose
+  // 0x00000007 label and `svce` differ, a non-Claude item that must be
+  // ignored, and a mix of <NULL> attributes.
+  const KEYCHAIN_DUMP = `keychain: "/Users/test/Library/Keychains/login.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    0x00000007 <blob>="Claude Code-credentials"
+    0x00000008 <blob>=<NULL>
+    "acct"<blob>="testuser"
+    "cdat"<timedate>=0x32303230303130313030303030305A00  "20200101000000Z\\000"
+    "crtr"<uint32>=<NULL>
+    "desc"<blob>=<NULL>
+    "icmt"<blob>=<NULL>
+    "mdat"<timedate>=0x32303230303130313030303030305A00  "20200101000000Z\\000"
+    "svce"<blob>="Claude Code-credentials"
+    "type"<uint32>=<NULL>
+keychain: "/Users/test/Library/Keychains/login.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    0x00000007 <blob>="Claude Code-credentials-12345678"
+    0x00000008 <blob>=<NULL>
+    "acct"<blob>="testuser"
+    "cdat"<timedate>=0x32303230303130313030303030305A00  "20200101000000Z\\000"
+    "desc"<blob>=<NULL>
+    "icmt"<blob>="Jack Test"
+    "svce"<blob>="Claude Code-credentials-12345678"
+    "type"<uint32>=<NULL>
+keychain: "/Users/test/Library/Keychains/login.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    0x00000007 <blob>="Example"
+    "acct"<blob>="some-db"
+    "desc"<blob>="application password"
+    "icmt"<blob>=<NULL>
+    "svce"<blob>="com.example.Example"
+keychain: "/Users/test/Library/Keychains/login.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    0x00000007 <blob>="Claude Code-credentials-23456789"
+    "acct"<blob>="testuser"
+    "desc"<blob>=<NULL>
+    "icmt"<blob>=<NULL>
+    "svce"<blob>="Claude Code-credentials-23456789"
+    "type"<uint32>=<NULL>
+`
+
+  it("parses every genp item in the dump", () => {
+    assert.equal(parseKeychainDump(KEYCHAIN_DUMP).length, 4)
+  })
+
+  it("extracts the svce attribute as service", () => {
+    assert.deepEqual(
+      parseKeychainDump(KEYCHAIN_DUMP).map((e) => e.service),
+      [
+        "Claude Code-credentials",
+        "Claude Code-credentials-12345678",
+        "com.example.Example",
+        "Claude Code-credentials-23456789",
+      ],
+    )
+  })
+
+  it("extracts the 0x00000007 attribute as label", () => {
+    const entries = parseKeychainDump(KEYCHAIN_DUMP)
+    assert.equal(entries[0].label, "Claude Code-credentials")
+    assert.equal(entries[1].label, "Claude Code-credentials-12345678")
+    assert.equal(entries[2].label, "Example")
+  })
+
+  it("extracts the icmt attribute as comment", () => {
+    assert.equal(parseKeychainDump(KEYCHAIN_DUMP)[1].comment, "Jack Test")
+  })
+
+  it("extracts the acct attribute as account", () => {
+    const entries = parseKeychainDump(KEYCHAIN_DUMP)
+    assert.equal(entries[0].account, "testuser")
+    assert.equal(entries[2].account, "some-db")
+  })
+
+  it("converts <NULL> attribute values to undefined", () => {
+    const entries = parseKeychainDump(KEYCHAIN_DUMP)
+    assert.equal(entries[0].comment, undefined)
+    assert.equal(entries[0].description, undefined)
+    assert.equal(entries[3].comment, undefined)
+  })
+
+  it("extracts a non-null desc attribute", () => {
+    assert.equal(
+      parseKeychainDump(KEYCHAIN_DUMP)[2].description,
+      "application password",
+    )
+  })
+
+  it("keeps each item's annotations attached to its own service", () => {
+    // The whole point of attribute parsing: "Jack Test" belongs to 12345678
+    // and must not leak onto its neighbours.
+    const byService = new Map(
+      parseKeychainDump(KEYCHAIN_DUMP).map((e) => [e.service, e]),
+    )
+    assert.equal(
+      byService.get("Claude Code-credentials-12345678")?.comment,
+      "Jack Test",
+    )
+    assert.equal(
+      byService.get("Claude Code-credentials-23456789")?.comment,
+      undefined,
+    )
+  })
+
+  it("skips items that have no svce attribute", () => {
+    const dump = `class: "genp"
+attributes:
+    "acct"<blob>="orphan"
+    "svce"<blob>=<NULL>
+class: "genp"
+attributes:
+    "acct"<blob>="ok"
+    "svce"<blob>="real"
+`
+    const entries = parseKeychainDump(dump)
+    assert.equal(entries.length, 1)
+    assert.equal(entries[0].service, "real")
+  })
+
+  it("returns an empty array for an empty dump", () => {
+    assert.deepEqual(parseKeychainDump(""), [])
+  })
+
+  it("returns an empty array when no genp items are present", () => {
+    assert.deepEqual(
+      parseKeychainDump(`keychain: "x"\nversion: 512\nclass: "inet"\n`),
+      [],
+    )
+  })
+})
+
+describe("deriveKeychainDescription", () => {
+  it("returns the comment when present", () => {
+    assert.equal(
+      deriveKeychainDescription({
+        service: "Claude Code-credentials-12345678",
+        comment: "Claude Sub 12345678",
+      }),
+      "Claude Sub 12345678",
+    )
+  })
+
+  it("trims surrounding whitespace from the comment", () => {
+    assert.equal(
+      deriveKeychainDescription({
+        service: "svc",
+        comment: "   spaced description   ",
+      }),
+      "spaced description",
+    )
+  })
+
+  it("returns undefined for an empty or whitespace-only comment", () => {
+    assert.equal(
+      deriveKeychainDescription({ service: "svc", comment: "" }),
+      undefined,
+    )
+    assert.equal(
+      deriveKeychainDescription({ service: "svc", comment: "   " }),
+      undefined,
+    )
+  })
+
+  it("returns undefined when comment is absent, ignoring label and desc", () => {
+    // We deliberately do NOT fall back to label or desc — `desc` is written by
+    // macOS ("application password") and the label mirrors the service, so the
+    // icmt field is the only user-meaningful annotation.
+    assert.equal(
+      deriveKeychainDescription({
+        service: "Claude Code-credentials-12345678",
+        label: "Claude Code-credentials-12345678",
+        description: "application password",
+      }),
+      undefined,
+    )
+  })
+
+  it("returns undefined for a fully empty entry", () => {
+    assert.equal(deriveKeychainDescription({ service: "svc" }), undefined)
   })
 })
 
@@ -935,7 +1290,7 @@ describe("writeBackCredentials (keychain source)", () => {
   // reach this branch, and `process.platform` is rewritten to "darwin" by the
   // harness so these run on any host.
   const SERVICE = "Claude Code-credentials"
-  const DUMP = `"${SERVICE}"`
+  const DUMP = genpDump([{ service: SERVICE }])
 
   const blob = (accessToken: string) =>
     JSON.stringify({

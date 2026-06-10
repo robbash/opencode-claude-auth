@@ -23,6 +23,17 @@ export interface ClaudeAccount {
   source: string
   configDir?: string
   credentials: ClaudeCredentials
+  /** User-set Keychain comment (`icmt`), when present. */
+  description?: string
+}
+
+/** A single `genp` item as reported by `security dump-keychain`. */
+export interface KeychainEntry {
+  service: string
+  label?: string
+  comment?: string
+  description?: string
+  account?: string
 }
 
 export const PRIMARY_SERVICE = "Claude Code-credentials"
@@ -142,7 +153,64 @@ function readKeychainService(serviceName: string): string | null {
   }
 }
 
-function listClaudeKeychainServices(): string[] {
+/**
+ * Parse `security dump-keychain` output into one entry per generic-password
+ * item.
+ *
+ * Attribute-based rather than regex-over-the-whole-dump so each item's
+ * annotations (`icmt`, `desc`) stay associated with its own service instead of
+ * being attributed to whichever item happened to be nearby in the text.
+ */
+export function parseKeychainDump(dump: string): KeychainEntry[] {
+  const entries: KeychainEntry[] = []
+  // Each item block begins with `class: "genp"` (or another class).
+  const blocks = dump.split(/^class:\s*"genp"\s*$/m).slice(1)
+  for (const block of blocks) {
+    // Stop at the next `class:` or `keychain:` boundary.
+    const end = block.search(/^(?:class:|keychain:)/m)
+    const body = end === -1 ? block : block.slice(0, end)
+
+    const read = (re: RegExp): string | undefined => {
+      const m = re.exec(body)
+      if (!m) return undefined
+      const v = m[1]
+      return v === "<NULL>" ? undefined : v
+    }
+
+    const service = read(/^\s*"svce"<blob>="([^"]*)"\s*$/m)
+    if (!service) continue
+
+    entries.push({
+      service,
+      label: read(/^\s*0x00000007 <blob>="([^"]*)"\s*$/m),
+      comment: read(/^\s*"icmt"<blob>="([^"]*)"\s*$/m),
+      description: read(/^\s*"desc"<blob>="([^"]*)"\s*$/m),
+      account: read(/^\s*"acct"<blob>="([^"]*)"\s*$/m),
+    })
+  }
+  return entries
+}
+
+/**
+ * The human-meaningful name for a Keychain entry, if the user set one.
+ *
+ * Deliberately only `icmt` (the "Comments" field in Keychain Access): `desc`
+ * is populated by macOS itself ("application password") and the 0x00000007
+ * label mirrors the service name, so neither carries user intent.
+ */
+export function deriveKeychainDescription(
+  entry: KeychainEntry,
+): string | undefined {
+  const comment = entry.comment?.trim()
+  return comment ? comment : undefined
+}
+
+// Any-length hex suffix so legacy entries stay discoverable. The
+// suffix-to-config-dir mapping below still only applies to the
+// 8-char hashes the Claude CLI generates.
+const CLAUDE_SERVICE_RE = /^Claude Code-credentials(?:-[0-9a-f]+)?$/
+
+function listClaudeKeychainEntries(): KeychainEntry[] {
   try {
     const dump = execSync("security dump-keychain", {
       timeout: 5000,
@@ -150,36 +218,36 @@ function listClaudeKeychainServices(): string[] {
       encoding: "utf-8",
     })
 
-    const services: string[] = []
-    const seen = new Set<string>()
+    const claude = parseKeychainDump(dump).filter((e) =>
+      CLAUDE_SERVICE_RE.test(e.service),
+    )
 
-    // Any-length hex suffix so legacy entries stay discoverable. The
-    // suffix-to-config-dir mapping below still only applies to the
-    // 8-char hashes the Claude CLI generates.
-    const re = /"Claude Code-credentials(?:-[0-9a-f]+)?"/g
-    let m = re.exec(dump)
-    while (m !== null) {
-      const svc = m[0].slice(1, -1)
-      if (!seen.has(svc)) {
-        seen.add(svc)
-        services.push(svc)
-      }
-      m = re.exec(dump)
+    // Dedup by service while preserving order, primary first.
+    const byService = new Map<string, KeychainEntry>()
+    for (const e of claude) {
+      if (!byService.has(e.service)) byService.set(e.service, e)
     }
 
-    const ordered: string[] = []
-    if (seen.has(PRIMARY_SERVICE)) ordered.push(PRIMARY_SERVICE)
-    for (const svc of services) {
-      if (svc !== PRIMARY_SERVICE) ordered.push(svc)
+    const ordered: KeychainEntry[] = []
+    const primary = byService.get(PRIMARY_SERVICE)
+    if (primary) ordered.push(primary)
+    for (const [svc, e] of byService) {
+      if (svc !== PRIMARY_SERVICE) ordered.push(e)
     }
-    log("keychain_list", { servicesFound: ordered })
+
+    log("keychain_list", {
+      servicesFound: ordered.map((e) => e.service),
+      withDescription: ordered
+        .filter((e) => deriveKeychainDescription(e))
+        .map((e) => e.service),
+    })
     return ordered
   } catch (err) {
     log("keychain_list", {
       error: "Failed to list keychain services",
       message: err instanceof Error ? err.message : String(err),
     })
-    return [PRIMARY_SERVICE]
+    return [{ service: PRIMARY_SERVICE }]
   }
 }
 
@@ -281,19 +349,21 @@ function discoverConfigDirsForKeychain(
   return result
 }
 
+/** "Claude Pro" / "Claude" — the tier label, before any disambiguation. */
+function tierLabel(creds: ClaudeCredentials): string {
+  if (!creds.subscriptionType) return "Claude"
+  const tier =
+    creds.subscriptionType.charAt(0).toUpperCase() +
+    creds.subscriptionType.slice(1)
+  return `Claude ${tier}`
+}
+
 export function buildAccountLabels(
   credsList: ClaudeCredentials[],
   emails?: (string | null)[],
   sources?: (string | null)[],
 ): string[] {
-  const baseLabels = credsList.map((c) => {
-    if (c.subscriptionType) {
-      const tier =
-        c.subscriptionType.charAt(0).toUpperCase() + c.subscriptionType.slice(1)
-      return `Claude ${tier}`
-    }
-    return "Claude"
-  })
+  const baseLabels = credsList.map(tierLabel)
 
   const counts = new Map<string, number>()
   for (const l of baseLabels) counts.set(l, (counts.get(l) ?? 0) + 1)
@@ -326,23 +396,25 @@ export function readAllClaudeAccounts(): ClaudeAccount[] {
     return [{ label, source: "file", configDir, credentials: creds }]
   }
 
-  const services = listClaudeKeychainServices()
+  const entries = listClaudeKeychainEntries()
   const keychainAccounts: Array<{
     source: string
     suffix: string | null
     credentials: ClaudeCredentials
+    description?: string
   }> = []
 
-  for (const svc of services) {
-    const raw = readKeychainService(svc)
+  for (const entry of entries) {
+    const raw = readKeychainService(entry.service)
     if (!raw) continue
     const creds = parseCredentials(raw)
     if (!creds) continue
-    const suffixMatch = svc.match(/-([0-9a-f]{8})$/)
+    const suffixMatch = entry.service.match(/-([0-9a-f]{8})$/)
     keychainAccounts.push({
-      source: svc,
+      source: entry.service,
       suffix: suffixMatch ? suffixMatch[1] : null,
       credentials: creds,
+      description: deriveKeychainDescription(entry),
     })
   }
 
@@ -377,6 +449,7 @@ export function readAllClaudeAccounts(): ClaudeAccount[] {
       credentials: a.credentials,
       configDir,
       email,
+      description: a.description,
     }
   })
 
@@ -388,11 +461,17 @@ export function readAllClaudeAccounts(): ClaudeAccount[] {
 
   return resolved.map((a, i) => {
     const account: ClaudeAccount = {
-      label: labels[i],
+      // A user-set Keychain comment beats both the generated number and the
+      // email, because it is the only label the user actually chose. Shows as
+      // e.g. "Claude Pro - Claude Sub Duncan".
+      label: a.description
+        ? `${tierLabel(a.credentials)} - ${a.description}`
+        : labels[i],
       source: a.source,
       credentials: a.credentials,
     }
     if (a.configDir) account.configDir = a.configDir
+    if (a.description) account.description = a.description
     return account
   })
 }

@@ -1,7 +1,13 @@
-.PHONY: build test test-models lint fix format clean intercept intercept-all intercept-update validate-oauth validate-oauth-dry
+.PHONY: build bundle install-local test test-models lint fix format clean intercept intercept-all intercept-update validate-oauth validate-oauth-dry
 
 build:
 	pnpm run build
+
+bundle:  ## Single-file ESM bundle for drop-in plugin install (dist/plugin.js)
+	pnpm run build:bundle
+
+install-local: ## Bundle and copy into ~/.config/opencode/plugins/
+	pnpm run install:local
 
 test:
 	pnpm test

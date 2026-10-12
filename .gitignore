@@ -1,5 +1,6 @@
 node_modules/
 .pnpm-store/
+.test-tmp/
 dist/
 .env
 *.env.local

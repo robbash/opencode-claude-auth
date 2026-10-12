@@ -1,6 +1,6 @@
 {
   "name": "opencode-claude-auth",
-  "version": "2.2.1",
+  "version": "3.0.0",
   "description": "OpenCode plugin that uses your Claude Code credentials — no separate login needed.",
   "keywords": [
     "anthropic",
@@ -15,42 +15,24 @@
     "url": "git+https://github.com/griffinmartin/opencode-claude-auth.git"
   },
   "files": [
-    "opencode-claude-auth.js",
     "dist",
     "installation.md"
   ],
   "type": "module",
-  "main": "opencode-claude-auth.js",
-  "module": "opencode-claude-auth.js",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./opencode-claude-auth.js"
-    },
-    "./server": {
-      "types": "./dist/index.d.ts",
-      "import": "./opencode-claude-auth.js"
-    },
-    "./claude-auth-plugin": {
-      "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./claude-auth-plugin.js": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    },
-    "./opencode-claude-auth": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    },
-    "./opencode-claude-auth.js": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    }
+    "./package.json": "./package.json"
   },
   "scripts": {
     "build": "rm -rf dist && tsc && cp src/anthropic-prompt.txt dist/",
+    "build:bundle": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/plugin.js --external:@opencode/plugin --legal-comments=none",
+    "install:local": "pnpm run build:bundle && mkdir -p \"$HOME/.config/opencode/plugins\" && cp dist/plugin.js \"$HOME/.config/opencode/plugins/opencode-claude-auth.js\"",
     "test": "node --test --experimental-strip-types src/**/*.test.ts scripts/**/*.test.ts",
     "test:models": "pnpm run build && node scripts/test-models.ts",
     "test:headless": "pnpm run build && node --experimental-strip-types scripts/test-headless.ts",
@@ -64,14 +46,16 @@
     "prepublishOnly": "pnpm run build && pnpm test"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "latest",
+    "@opencode/plugin": "2.0.26",
+    "@opencode/sdk": "2.0.26",
     "@types/node": "^25.5.0",
-    "oxfmt": "0.41.0",
+    "esbuild": "^0.28.2",
+    "oxfmt": "0.72.0",
     "oxlint": "1.56.0",
     "typescript": "^5.0.0"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": "*"
+    "@opencode/plugin": "^2.0.0"
   },
   "packageManager": "pnpm@10.32.1"
 }

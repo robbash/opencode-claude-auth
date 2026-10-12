@@ -6,11 +6,25 @@
 
 Self-contained Anthropic auth provider for OpenCode using your Claude Code credentials — no separate login or API key needed.
 
+> **OpenCode v2 required.** Version 3.x of this plugin targets the OpenCode v2
+> plugin API (`@opencode/plugin`). For OpenCode 1.x, pin `opencode-claude-auth@2`.
+> See [Migrating from 2.x](#migrating-from-2x).
+
 ## How it works
 
-The plugin registers its own auth provider with a custom fetch handler that intercepts all Anthropic API requests. It reads OAuth tokens from the macOS Keychain (or `~/.claude/.credentials.json` — or `$CLAUDE_CONFIG_DIR/.credentials.json` if that env var is set — on other platforms), caches them in memory with a 30-second TTL, and handles the full request lifecycle — no builtin Anthropic auth plugin required. On macOS, multiple Claude Code accounts are detected automatically and can be switched via `opencode auth login`.
+The plugin contributes an OAuth method to OpenCode's `anthropic` integration and
+hooks the session request pipeline. It reads OAuth tokens from the macOS Keychain
+(or `~/.claude/.credentials.json` — or `$CLAUDE_CONFIG_DIR/.credentials.json`
+if that env var is set — on other platforms), caches them in memory with
+a 30-second TTL, and rewrites every outbound Anthropic request to look like
+Claude Code. On macOS, multiple Claude Code accounts are detected automatically
+and can be switched when connecting the integration.
 
-It also syncs credentials to OpenCode's `auth.json` as a fallback (on Windows, it writes to both `%USERPROFILE%\.local\share\opencode\auth.json` and `%LOCALAPPDATA%\opencode\auth.json` to cover all installation methods). If a token is near expiry, it refreshes directly via Anthropic's OAuth endpoint (zero LLM tokens consumed), falling back to the Claude CLI if the direct refresh fails. Background re-sync runs every 5 minutes.
+If a token is near expiry, it refreshes directly via Anthropic's OAuth endpoint
+(zero LLM tokens consumed), falling back to the Claude CLI if the direct refresh
+fails. OpenCode pulls refreshed credentials through the integration's `refresh`
+callback. A 5-minute background refresh runs alongside it so a token that
+expires while OpenCode is idle is renewed before it is needed.
 
 ## Alternative: CLIProxyAPI (plugin not required)
 
@@ -37,7 +51,7 @@ Remove `opencode-claude-auth` from your `plugin` list when using this setup — 
 ## Prerequisites
 
 - Claude Code installed and authenticated (run `claude` at least once)
-- OpenCode installed
+- OpenCode v2 installed
 
 macOS is preferred (uses Keychain). Linux and Windows work via the credentials file fallback.
 
@@ -59,11 +73,12 @@ Install the opencode-claude-auth plugin and configure it by following: https://r
 
    ```json
    {
-     "plugin": ["opencode-claude-auth@latest"]
+     "plugins": ["opencode-claude-auth@latest"]
    }
    ```
 
-   > The `@latest` tag ensures OpenCode always pulls the newest version on startup. No manual `npm install` is needed — OpenCode [automatically installs npm plugins using Bun at startup](https://opencode.ai/docs/plugins/#how-plugins-are-installed).
+   > Note the key is `plugins` (plural) in OpenCode v2; v1 used `plugin`.
+   > The `@latest` tag ensures OpenCode always pulls the newest version on startup. No manual `npm install` is needed — OpenCode installs npm plugins at startup.
 
 2. **Use it** — just run OpenCode. The plugin handles auth automatically using your Claude Code credentials.
 
@@ -196,25 +211,37 @@ export ANTHROPIC_CLI_VERSION=2.2.0
 
 ## How it works (technical)
 
-- Registers an `auth.loader` with a custom `fetch` that intercepts all Anthropic API requests
-- Sets `Authorization: Bearer` with fresh OAuth tokens (cached in memory, 30s TTL, updated in-place after refresh)
-- Translates tool names between OpenCode and Anthropic API formats (adds/strips `mcp_` prefix)
-- Buffers SSE response streams at event boundaries for reliable tool name translation
-- Injects Claude Code identity into system prompts via `experimental.chat.system.transform`
-- Sets required API headers (beta flags, billing, user-agent) with model-aware selection
-- On macOS, enumerates all `Claude Code-credentials*` Keychain entries and labels them by subscription tier
-- Provides an account switcher via `opencode auth login` when multiple accounts are found; persists selection to `~/.local/share/opencode/claude-account-source.txt`
-- Syncs credentials to `auth.json` on startup and every 5 minutes as a fallback; that same tick proactively refreshes once the token is within an hour of expiry
-- On Windows, writes to both `%USERPROFILE%\.local\share\opencode\auth.json` and `%LOCALAPPDATA%\opencode\auth.json`
-- Re-reads the credential source on every cache miss, so an account rotated by something other than this plugin — the `claude` CLI in another terminal, a second OpenCode instance, or a switcher like [claude-swap](https://github.com/realiti4/claude-swap) — gets picked up mid-session without a restart. Bounded by the same 30s cache, so it adds at most about two source reads a minute under load. A stored token is adopted whenever it is usable, and when it isn't only if the one already held is also unusable — otherwise a failed write-back would resurrect the pre-refresh token it left behind
+Built on the OpenCode v2 plugin API (`Plugin.define({ id, setup })`).
+
+- Registers an OAuth method on the `anthropic` integration via `ctx.integration.transform`, with an account picker form when multiple Claude Code accounts exist
+- Rewrites every outbound request in `ctx.session.hook("http.request")`: sets `Authorization: Bearer` with fresh OAuth tokens (cached in memory, 30s TTL), adds `?beta=true` to `/v1/messages`, sets Claude Code headers (beta flags, billing, user-agent, stainless) with model-aware selection, strips `x-api-key`, and adds the `mcp_` tool-name prefix
+- Transforms SSE responses in `ctx.session.hook("http.response")`, buffering at event boundaries to reliably strip the `mcp_` prefix back out
+- Injects the Claude Code identity into system prompts via `ctx.session.hook` on `context`, `compaction`, `generate` and `title` — every request kind the session issues
+- Zeroes per-token model cost via `ctx.model.transform`, since subscription usage isn't billed per token
+- Decides retries in `ctx.session.hook("retry")`: long-context beta rejections drop one beta flag per attempt before retrying, 401s recover credentials (below), and 429/529 honour the `retry-after` captured from the response, surfacing immediately past `OPENCODE_CLAUDE_AUTH_MAX_RETRY_MS` so an hour-long quota reset doesn't look like a hang
+- On a 401, recovers before agreeing to retry: adopts an externally rotated token if the source now holds one, otherwise forces an OAuth refresh. A 401 that recovery can't make progress on stops the retry rather than re-sending the rejected token, and is returned unmodified without SSE transformation since it carries an error body rather than a stream
+- On a 429, re-reads the source once and retries without backoff only if the access token changed, so a rate limit another process has already resolved by switching accounts isn't surfaced. A changed token isn't proof of a switch — a routine refresh of the same account changes it too — so this costs at most one extra request
+- Re-reads the credential source on every cache miss, so an account rotated by something other than this plugin — the `claude` CLI in another terminal, a second OpenCode instance, or a switcher like [claude-swap](https://github.com/realiti4/claude-swap) — gets picked up mid-session without a restart
 - Guards credential write-back with the access token the refresh started from, so a switch landing mid-refresh can't write one account's rotated tokens into another account's slot
-- Retries API requests on 429 (rate limit) and 529 (overloaded) with exponential backoff, respecting `retry-after` headers
-- On a 429 that outlives those backoff retries, re-reads the source once and retries only if the access token changed, so a rate limit another process has already resolved by switching accounts isn't surfaced. A changed token isn't proof of a switch — a routine refresh of the same account changes it too — so this costs at most one extra request
-- On a 401, recovers in place rather than surfacing it: adopts an externally rotated token if the source now holds one, otherwise forces an OAuth refresh, then retries the request. Bounded at two attempts, so a rejected token costs at most three API calls. A 401 that survives recovery is returned unmodified, without SSE stream transformation, since it carries an error body rather than a stream
-- Refreshes directly via `POST https://claude.ai/v1/oauth/token` using the runtime's own `fetch` (no LLM tokens consumed, no subprocess). Requests are triggered within 60 seconds of expiry on the API request path and within an hour on the background tick; concurrent refreshes of one account share a single request, since each rotation invalidates the previous refresh token
-- Falls back to the `claude` CLI only within the 60-second window, the point at which Claude Code will actually rotate the token — running it earlier costs a real API request and returns the same token. New tokens are written back to Keychain (macOS) or credentials file (Linux/Windows) to keep stored credentials in sync with rotated refresh tokens
-- If credentials aren't OAuth-based, the auth loader returns `{}` and falls through to API key auth
-- If credentials are unavailable or unreadable, the plugin disables itself and OpenCode continues without Claude auth
+- On macOS, enumerates all `Claude Code-credentials*` Keychain entries and labels them by subscription tier; persists the selection to `~/.local/share/opencode/claude-account-source.txt`
+- When a token is within 60 seconds of expiry, refreshes directly via `POST https://claude.ai/v1/oauth/token` (no LLM tokens consumed). Falls back to `claude` CLI if the direct refresh fails. New tokens are written back to Keychain (macOS) or credentials file (Linux/Windows) to keep stored credentials in sync with rotated refresh tokens
+- OpenCode pulls refreshed tokens through the integration's `refresh` callback. A 5-minute tick still syncs `auth.json` and proactively refreshes once the token is within an hour of expiry, so idle sessions don't expire mid-use
+- On Windows, writes to both `%USERPROFILE%\.local\share\opencode\auth.json` and `%LOCALAPPDATA%\opencode\auth.json`
+- If credentials are unavailable or unreadable, `setup` returns early and OpenCode continues without Claude auth
+
+## Migrating from 2.x
+
+| 2.x (OpenCode v1)                        | 3.x (OpenCode v2)                                          |
+| ---------------------------------------- | ---------------------------------------------------------- |
+| `"plugin": [...]`                        | `"plugins": [...]`                                         |
+| Account switch via `opencode auth login` | Account picker when connecting the `anthropic` integration |
+| Peer dependency `@opencode-ai/plugin`    | Peer dependency `@opencode/plugin` `^2.0.0`                |
+| Entrypoint aliases (`./server`, …)       | Single `.` entrypoint                                      |
+| `ClaudeAuthPlugin` named export          | Default export only (`Plugin.define`)                      |
+
+OpenCode now holds credentials in its own credential store and pulls refreshes
+through the integration's `refresh` callback. `auth.json` is still written on
+the 5-minute tick, so tools reading it keep working.
 
 ## Disclaimer
 

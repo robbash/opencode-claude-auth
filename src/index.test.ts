@@ -10,7 +10,7 @@ import {
 import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
-import { before, describe, it } from "node:test"
+import { beforeEach, describe, it } from "node:test"
 import { pathToFileURL } from "node:url"
 
 // Keep the cross-process refresh lock off the real OpenCode data dir in tests.
@@ -24,44 +24,14 @@ interface ClaudeCredentials {
   expiresAt: number
 }
 
-type TestAuthLoader = (
-  getAuth: () => Promise<{
-    type: "oauth"
-    refresh: string
-    access: string
-    expires: number
-  }>,
-  provider: { models: Record<string, { cost?: unknown }> },
-) => Promise<{
-  fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
-}>
-
 interface Account {
   label: string
   source: string
   credentials: ClaudeCredentials
 }
 
-// Mirrors authorize()'s account-resolution logic
-function resolveAccount(
-  accounts: Account[],
-  selectedSource: string | undefined,
-): Account {
-  const found = accounts.find((a) => a.source === selectedSource)
-  return found ?? accounts[0]
-}
-
-// Mirrors the select prompt options builder
-function buildSelectOptions(
-  accounts: Account[],
-  activeSource: string,
-): Array<{ label: string; value: string; hint?: string }> {
-  return accounts.map((a) => ({
-    label: a.label,
-    value: a.source,
-    hint: a.source === activeSource ? "active" : undefined,
-  }))
-}
+// `resolveAccount` and `buildAccountOptions` are real exports under v2 and are
+// exercised directly below, so the v1 test-local mirrors of them are gone.
 
 // Mirrors syncToPath logic
 function syncToPath(
@@ -105,25 +75,6 @@ function refreshIfNeeded(
   return creds.expiresAt > nowMs + 60_000 ? "fresh" : "expired"
 }
 
-// Mirrors the authorize() callback return shape
-function buildAuthorizeResult(account: Account) {
-  const creds = account.credentials
-  return {
-    url: "",
-    instructions: `Using ${account.label} — credentials loaded from macOS Keychain.`,
-    method: "auto" as const,
-    async callback() {
-      return {
-        type: "success" as const,
-        provider: "anthropic",
-        access: creds.accessToken,
-        refresh: creds.refreshToken,
-        expires: creds.expiresAt,
-      }
-    },
-  }
-}
-
 const SOURCE_FILES = [
   "index.ts",
   "betas.ts",
@@ -136,6 +87,28 @@ const SOURCE_FILES = [
   "logger.ts",
   "http.ts",
 ] as const
+
+/**
+ * Temp copies must live inside the project: index.ts imports
+ * `@opencode/plugin`, and Node resolves bare specifiers by walking up to the
+ * nearest node_modules, so an OS-temp dir would never find it. It also cannot
+ * live *under* node_modules, where Node refuses to strip TypeScript types.
+ */
+const TEMP_ROOT = new URL("../.test-tmp/", import.meta.url)
+const createdTempDirs: string[] = []
+
+async function makeProjectTempDir(prefix: string): Promise<string> {
+  mkdirSync(TEMP_ROOT, { recursive: true })
+  const dir = await mkdtemp(join(TEMP_ROOT.pathname, prefix))
+  createdTempDirs.push(dir)
+  return dir
+}
+
+process.on("exit", () => {
+  for (const dir of createdTempDirs) {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 async function copySourceFiles(
   tempDir: string,
@@ -177,42 +150,11 @@ async function copySourceFiles(
   )
 }
 
-async function loadHelpersWithCountingKeychain(
-  initialExpiresAt: number,
-  options: { oauthTokenUrl?: string; throwOnReload?: boolean } = {},
-): Promise<{
-  helpersModule: typeof import("./index.ts")
-  keychainModule: {
-    __getReadCount: () => number
-    __setCredentials: (c: ClaudeCredentials) => void
-  }
-}> {
-  const tempDir = await mkdtemp(join(tmpdir(), "opencode-claude-auth-cache-"))
-  const tempKeychain = join(tempDir, "keychain.ts")
-
-  await copySourceFiles(tempDir, options)
-  if (options.throwOnReload) {
-    const tempCredentials = join(tempDir, "credentials.ts")
-    const reloadSignature =
-      "export function reloadCredentialsFromSource(): ClaudeCredentials | null {"
-    const credentialsSource = await readFile(tempCredentials, "utf8")
-    assert.ok(credentialsSource.includes(reloadSignature))
-    await writeFile(
-      tempCredentials,
-      credentialsSource.replace(
-        reloadSignature,
-        `${reloadSignature}\n  throw new Error("forced reload failure")`,
-      ),
-      "utf8",
-    )
-  }
-  await writeFile(
-    tempKeychain,
-    `let readCount = 0
+const KEYCHAIN_STUB = (expiresAt: string) => `let readCount = 0
 let credentials = {
   accessToken: "token",
   refreshToken: "refresh",
-  expiresAt: ${initialExpiresAt}
+  expiresAt: ${expiresAt}
 }
 
 export const PRIMARY_SERVICE = "Claude Code-credentials"
@@ -240,15 +182,72 @@ export function __getReadCount() {
 export function __setCredentials(c) {
   credentials = c
 }
-`,
+`
+
+interface LoadOptions {
+  oauthTokenUrl?: string
+  /** Force reloadCredentialsFromSource to throw, exercising the catch paths. */
+  throwOnReload?: boolean
+}
+
+async function prepareTempModule(
+  expiresAt: string,
+  opts: LoadOptions,
+): Promise<string> {
+  const tempDir = await makeProjectTempDir("plugin-")
+  await copySourceFiles(tempDir, opts)
+
+  if (opts.throwOnReload) {
+    const tempCredentials = join(tempDir, "credentials.ts")
+    const reloadSignature =
+      "export function reloadCredentialsFromSource(): ClaudeCredentials | null {"
+    const credentialsSource = await readFile(tempCredentials, "utf8")
+    assert.ok(credentialsSource.includes(reloadSignature))
+    await writeFile(
+      tempCredentials,
+      credentialsSource.replace(
+        reloadSignature,
+        `${reloadSignature}\n  throw new Error("forced reload failure")`,
+      ),
+      "utf8",
+    )
+  }
+
+  await writeFile(
+    join(tempDir, "keychain.ts"),
+    KEYCHAIN_STUB(expiresAt),
     "utf8",
   )
+  return tempDir
+}
 
+async function loadPluginModule(
+  expiresAt = "Date.now() + 10 * 60 * 1000",
+  opts: LoadOptions = {},
+): Promise<typeof import("./index.ts")> {
+  const tempDir = await prepareTempModule(expiresAt, opts)
+  return import(pathToFileURL(join(tempDir, "index.ts")).href)
+}
+
+/**
+ * The plugin module plus handles on its stubbed keychain, for the credential
+ * recovery paths that need to rotate the backing store mid-test.
+ */
+async function loadPluginWithKeychainControls(
+  expiresAt = "Date.now() + 10 * 60 * 1000",
+  opts: LoadOptions = {},
+): Promise<{
+  helpersModule: typeof import("./index.ts")
+  keychainModule: {
+    __getReadCount: () => number
+    __setCredentials: (c: ClaudeCredentials) => void
+  }
+}> {
+  const tempDir = await prepareTempModule(expiresAt, opts)
   const [helpersModule, keychainModule] = await Promise.all([
     import(pathToFileURL(join(tempDir, "index.ts")).href),
-    import(pathToFileURL(tempKeychain).href),
+    import(pathToFileURL(join(tempDir, "keychain.ts")).href),
   ])
-
   return {
     helpersModule,
     keychainModule: keychainModule as {
@@ -256,6 +255,103 @@ export function __setCredentials(c) {
       __setCredentials: (c: ClaudeCredentials) => void
     },
   }
+}
+
+// --- Fake v2 plugin context -------------------------------------------------
+
+interface HookEntry {
+  name: string
+  callback: (event: unknown) => unknown
+  options?: { providerID?: string }
+}
+
+interface FakeContext {
+  ctx: unknown
+  hooks: HookEntry[]
+  modelTransforms: Array<(editor: unknown) => void>
+  integrationTransforms: Array<(editor: unknown) => void>
+}
+
+function createFakeContext(options: Record<string, unknown> = {}): FakeContext {
+  const hooks: HookEntry[] = []
+  const modelTransforms: Array<(editor: unknown) => void> = []
+  const integrationTransforms: Array<(editor: unknown) => void> = []
+  const registration = { dispose: async () => {} }
+
+  const ctx = {
+    options,
+    location: {
+      directory: "/tmp/project",
+      project: {
+        id: "p1",
+        directory: "/tmp/project",
+        canonical: "/tmp/project",
+      },
+    },
+    session: {
+      hook: async (
+        name: string,
+        callback: (event: unknown) => unknown,
+        hookOptions?: { providerID?: string },
+      ) => {
+        hooks.push({ name, callback, options: hookOptions })
+        return registration
+      },
+    },
+    model: {
+      transform: async (callback: (editor: unknown) => void) => {
+        modelTransforms.push(callback)
+        return registration
+      },
+      reload: async () => {},
+    },
+    integration: {
+      transform: async (callback: (editor: unknown) => void) => {
+        integrationTransforms.push(callback)
+        return registration
+      },
+      reload: async () => {},
+    },
+  }
+
+  return { ctx, hooks, modelTransforms, integrationTransforms }
+}
+
+function findHook(hooks: HookEntry[], name: string): HookEntry {
+  const entry = hooks.find((hook) => hook.name === name)
+  assert.ok(entry, `Expected a "${name}" hook to be registered`)
+  return entry
+}
+
+/** Collect the method registrations an integration transform produces. */
+function collectMethodRegistrations(
+  integrationTransforms: Array<(editor: unknown) => void>,
+): Array<Record<string, unknown>> {
+  const registrations: Array<Record<string, unknown>> = []
+  for (const transform of integrationTransforms) {
+    transform({
+      method: { update: (input: never) => registrations.push(input) },
+    })
+  }
+  return registrations
+}
+
+/**
+ * Switch the active account the way the TUI does: through the registered
+ * method's `authorize`. v1 reached `plugin.auth.methods[0].authorize`
+ * directly; under v2 the method only exists inside the integration transform.
+ */
+async function authorizeVia(
+  integrationTransforms: Array<(editor: unknown) => void>,
+  answer: Record<string, unknown>,
+): Promise<void> {
+  const [registration] = collectMethodRegistrations(integrationTransforms)
+  assert.ok(registration, "expected an oauth method registration")
+  await (
+    registration as unknown as {
+      authorize: (answer: unknown) => Promise<unknown>
+    }
+  ).authorize(answer)
 }
 
 /**
@@ -276,9 +372,7 @@ async function loadHelpersWithMultiAccountKeychain(opts: {
 }): Promise<{
   helpersModule: typeof import("./index.ts")
 }> {
-  const tempDir = await mkdtemp(
-    join(tmpdir(), "opencode-claude-auth-multi-acct-"),
-  )
+  const tempDir = await makeProjectTempDir("multi-acct-")
   const tempKeychain = join(tempDir, "keychain.ts")
 
   await copySourceFiles(tempDir)
@@ -362,28 +456,18 @@ const realFs = {
   dirname: (p: string) => dirname(p),
 }
 
-let helpers: typeof import("./index.ts")
+// Loaded at module scope: top-level `describe` blocks do not run strictly
+// after one another's `before` hooks, so a hook-assigned binding would still
+// be undefined in later suites.
+process.env.HOME = await mkdtemp(join(tmpdir(), "claude-auth-home-"))
+
+/** Expired credentials: fine for the pure helpers, which never read them. */
+const helpers = await loadPluginModule("1")
+
+/** Valid credentials, used by the setup/hook suites. */
+const plugin = await loadPluginModule()
 
 describe("exported helpers", () => {
-  before(async () => {
-    const tempDir = await mkdtemp(join(tmpdir(), "opencode-claude-auth-"))
-    const tempKeychain = join(tempDir, "keychain.ts")
-
-    await copySourceFiles(tempDir)
-    await writeFile(
-      tempKeychain,
-      `export const PRIMARY_SERVICE = "Claude Code-credentials"
-export function readAllClaudeAccounts() { return [{ label: "Account 1", source: "Claude Code-credentials", credentials: { accessToken: "token", refreshToken: "refresh", expiresAt: 1 } }] }
-export function refreshAccount() { return null }
-export function writeBackCredentials() { return true }
-export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account \${i + 1}\`) }
-`,
-      "utf8",
-    )
-
-    helpers = await import(pathToFileURL(join(tempDir, "index.ts")).href)
-  })
-
   it("buildRequestHeaders sets auth headers and strips x-api-key", () => {
     const headers = helpers.buildRequestHeaders(
       "https://api.anthropic.com/v1/messages",
@@ -528,8 +612,6 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
   it("ANTHROPIC_CLI_VERSION overrides version in billing header (via transformBody)", () => {
     process.env.ANTHROPIC_CLI_VERSION = "9.9.9"
     try {
-      // The billing header is now computed and injected by transformBody,
-      // so we test via transformBody rather than buildRequestHeaders
       const { transformBody } = helpers
       const body = JSON.stringify({
         system: [{ type: "text", text: "test" }],
@@ -568,6 +650,48 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     assert.equal(headers.get("x-stainless-runtime"), "custom-runtime")
   })
 
+  it("buildRequestUrl adds beta=true to /v1/messages", () => {
+    assert.equal(
+      helpers.buildRequestUrl("https://api.anthropic.com/v1/messages"),
+      "https://api.anthropic.com/v1/messages?beta=true",
+    )
+  })
+
+  it("buildRequestUrl leaves an existing beta param alone", () => {
+    assert.equal(
+      helpers.buildRequestUrl(
+        "https://api.anthropic.com/v1/messages?beta=false",
+      ),
+      "https://api.anthropic.com/v1/messages?beta=false",
+    )
+  })
+
+  it("buildRequestUrl leaves other paths untouched", () => {
+    assert.equal(
+      helpers.buildRequestUrl("https://api.anthropic.com/v1/models"),
+      "https://api.anthropic.com/v1/models",
+    )
+  })
+
+  it("parseModelId reads the model from a JSON body", () => {
+    assert.equal(
+      helpers.parseModelId(JSON.stringify({ model: "claude-haiku-4-5" })),
+      "claude-haiku-4-5",
+    )
+  })
+
+  it("parseModelId returns null for absent, empty or invalid bodies", () => {
+    assert.equal(helpers.parseModelId(undefined), null)
+    assert.equal(helpers.parseModelId(""), null)
+    assert.equal(helpers.parseModelId("not json"), null)
+    assert.equal(helpers.parseModelId(JSON.stringify({})), null)
+  })
+})
+
+// --- fetchWithRetry still backs the OAuth refresh in credentials.ts, even
+// though v2 leaves the model request itself to OpenCode. -------------------
+
+describe("fetchWithRetry", () => {
   it("fetchWithRetry retries on 429 and succeeds", async () => {
     let callCount = 0
     const mockFetch = (() => {
@@ -798,115 +922,331 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
       `Expected at least 1900ms fallback delay, got ${elapsed}ms`,
     )
   })
+})
 
-  it("system transform does not inject when system already contains prefix", async () => {
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    globalThis.setInterval = (() => ({
-      unref() {},
-    })) as unknown as typeof setInterval
+// --- Retry policy (replaces v1's inline retry loops) -----------------------
 
+describe("decideRetry", () => {
+  beforeEach(() => {
+    helpers.resetExcludedBetas()
+  })
+
+  it("retries a 429 using the captured retry-after delay", () => {
+    const outcome = helpers.decideRetry(
+      { status: 429 },
+      1,
+      "claude-sonnet-4-6",
+      5_000,
+    )
+    assert.deepEqual(outcome, {
+      retry: true,
+      delay: 5_000,
+      reason: "rate_limited",
+    })
+  })
+
+  it("retries a 529 with an exponential fallback when retry-after is absent", () => {
+    assert.deepEqual(helpers.decideRetry({ status: 529 }, 1, "m"), {
+      retry: true,
+      delay: 2_000,
+      reason: "rate_limited",
+    })
+    assert.deepEqual(helpers.decideRetry({ status: 529 }, 2, "m"), {
+      retry: true,
+      delay: 4_000,
+      reason: "rate_limited",
+    })
+  })
+
+  it("stops retrying when the delay exceeds the cap (quota reset)", () => {
+    const outcome = helpers.decideRetry({ status: 429 }, 1, "m", 31_000)
+    assert.deepEqual(outcome, { retry: false, reason: "rate_limit_quota" })
+  })
+
+  it("respects OPENCODE_CLAUDE_AUTH_MAX_RETRY_MS", () => {
+    process.env.OPENCODE_CLAUDE_AUTH_MAX_RETRY_MS = "500"
     try {
-      const plugin = await helpers.default({} as never)
-      assert.equal(
-        typeof plugin["experimental.chat.system.transform"],
-        "function",
-      )
-
-      const transform = plugin["experimental.chat.system.transform"] as (
-        input: { model?: { providerID?: string } },
-        output: { system: string[] },
-      ) => Promise<void>
-
-      const prefixed =
-        "You are Claude Code, Anthropic's official CLI for Claude.\n\nExisting"
-      const output = { system: [prefixed] }
-
-      await transform({ model: { providerID: "anthropic" } }, output)
-
-      assert.deepEqual(output.system, [prefixed])
+      assert.deepEqual(helpers.decideRetry({ status: 429 }, 1, "m", 1_000), {
+        retry: false,
+        reason: "rate_limit_quota",
+      })
     } finally {
-      globalThis.setInterval = originalSetInterval
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
+      delete process.env.OPENCODE_CLAUDE_AUTH_MAX_RETRY_MS
     }
   })
 
-  it("system transform injects prefix at most once when already present", async () => {
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    globalThis.setInterval = (() => ({
-      unref() {},
-    })) as unknown as typeof setInterval
-
-    try {
-      const plugin = await helpers.default({} as never)
-      const transform = plugin["experimental.chat.system.transform"] as (
-        input: { model?: { providerID?: string } },
-        output: { system: string[] },
-      ) => Promise<void>
-
-      const output = {
-        system: [
-          "Existing instruction",
-          "You are Claude Code, Anthropic's official CLI for Claude.\n\nAlready present",
-        ],
-      }
-
-      await transform({ model: { providerID: "anthropic" } }, output)
-
-      const occurrences = output.system
-        .join("\n")
-        .match(/You are Claude Code, Anthropic's official CLI for Claude\./g)
-      assert.equal(occurrences?.length, 1)
-    } finally {
-      globalThis.setInterval = originalSetInterval
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
-    }
+  it("retries a 401 once so fresh credentials are picked up", () => {
+    assert.deepEqual(helpers.decideRetry({ status: 401 }, 1, "m"), {
+      retry: true,
+      delay: 0,
+      reason: "auth_refresh",
+    })
   })
 
-  it("plugin calls unref on the sync interval timer", async () => {
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
+  it("gives up on a 401 after the retry attempt also failed", () => {
+    assert.deepEqual(helpers.decideRetry({ status: 401 }, 3, "m"), {
+      retry: false,
+      reason: "auth_retry_exhausted",
+    })
+  })
 
+  it("leaves OpenCode's decision alone for unrelated failures", () => {
+    assert.equal(helpers.decideRetry({ status: 500 }, 1, "m"), null)
+    assert.equal(helpers.decideRetry({ status: 400 }, 1, "m"), null)
+    assert.equal(helpers.decideRetry({}, 1, "m"), null)
+  })
+
+  it("excludes one long-context beta per attempt and retries", () => {
+    const body = JSON.stringify({
+      error: { message: "Extra usage is required for long context requests" },
+    })
+    const modelId = "claude-sonnet-4-6"
+
+    const first = helpers.decideRetry({ status: 400, body }, 1, modelId)
+    assert.equal(first?.retry, true)
+    assert.equal(
+      first && "reason" in first ? first.reason : undefined,
+      "long_context_beta_excluded",
+    )
+    const excludedBeta =
+      first && "excludedBeta" in first ? first.excludedBeta : undefined
+    assert.ok(excludedBeta, "Expected a beta to be excluded")
+    assert.ok(helpers.getExcludedBetas(modelId).has(excludedBeta!))
+  })
+
+  it("stops once every long-context beta is excluded", () => {
+    const body = "You're out of extra usage"
+    const modelId = "claude-sonnet-4-6"
+
+    for (let i = 0; i < helpers.LONG_CONTEXT_BETAS.length; i++) {
+      const outcome = helpers.decideRetry({ status: 400, body }, i + 1, modelId)
+      assert.equal(outcome?.retry, true, `attempt ${i + 1} should retry`)
+    }
+
+    assert.deepEqual(helpers.decideRetry({ status: 400, body }, 99, modelId), {
+      retry: false,
+      reason: "long_context_betas_exhausted",
+    })
+  })
+
+  it("treats a long-context 429 as a beta problem, not a rate limit", () => {
+    const outcome = helpers.decideRetry(
+      { status: 429, body: "long context beta is not yet available" },
+      1,
+      "claude-opus-4-6",
+    )
+    assert.equal(
+      outcome && "reason" in outcome ? outcome.reason : undefined,
+      "long_context_beta_excluded",
+    )
+  })
+})
+
+// --- Credential recovery: the v1 inline 401/429 retry loops, now reachable
+// as exported steps the retry hook composes. ---------------------------------
+
+/** A long-lived credential, so reload validity checks never reject it. */
+function recoveredCreds(accessToken: string): ClaudeCredentials {
+  return {
+    accessToken,
+    refreshToken: `rt-${accessToken}`,
+    expiresAt: Date.now() + 8 * 60 * 60_000,
+  }
+}
+
+function retryEvent(
+  overrides: Partial<{
+    sessionID: string
+    status: number
+    attempt: number
+    body: string
+  }> = {},
+) {
+  return {
+    sessionID: overrides.sessionID ?? "s1",
+    agent: "build",
+    model: { id: "claude-haiku-4-5", providerID: "anthropic" },
+    error: {
+      type: "api_error",
+      message: "failed",
+      status: overrides.status ?? 429,
+      ...(overrides.body ? { response: { body: overrides.body } } : {}),
+    },
+    attempt: overrides.attempt ?? 1,
+    decision: { retry: false } as { retry: boolean; delay?: number },
+  }
+}
+
+/** Drive one model request so the session has a recorded token. */
+async function sendRequest(
+  hooks: HookEntry[],
+  sessionID: string,
+): Promise<void> {
+  await findHook(hooks, "http.request").callback({
+    sessionID,
+    kind: "primary",
+    agent: "build",
+    model: { id: "claude-haiku-4-5", providerID: "anthropic" },
+    request: new Request("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
+    }),
+  })
+}
+
+describe("recoverRejectedToken", () => {
+  it("adopts a token rotated into the source by someone else", async () => {
+    let forceRefreshCalls = 0
+    const recovered = await helpers.recoverRejectedToken(
+      "rejected-token",
+      "claude-haiku-4-5",
+      {
+        reload: () => recoveredCreds("replacement-token"),
+        forceRefresh: async () => {
+          forceRefreshCalls += 1
+          return recoveredCreds("should-not-be-used")
+        },
+      },
+    )
+
+    assert.equal(recovered?.accessToken, "replacement-token")
+    assert.equal(
+      forceRefreshCalls,
+      0,
+      "a usable reload must not also burn an OAuth refresh",
+    )
+  })
+
+  it("force-refreshes when the source still holds the rejected token", async () => {
+    const recovered = await helpers.recoverRejectedToken(
+      "rejected-token",
+      "m",
+      {
+        reload: () => recoveredCreds("rejected-token"),
+        forceRefresh: async () => recoveredCreds("refreshed-token"),
+      },
+    )
+    assert.equal(recovered?.accessToken, "refreshed-token")
+  })
+
+  it("force-refreshes when the reload yields nothing usable", async () => {
+    // reloadCredentialsFromSource returns null for a credential expiring
+    // inside 60s, so "changed but unusable" has to reach the refresh too.
+    const recovered = await helpers.recoverRejectedToken("rejected", "m", {
+      reload: () => null,
+      forceRefresh: async () => recoveredCreds("refreshed-token"),
+    })
+    assert.equal(recovered?.accessToken, "refreshed-token")
+  })
+
+  it("returns null when neither step produces a different token", async () => {
+    const recovered = await helpers.recoverRejectedToken("rejected", "m", {
+      reload: () => recoveredCreds("rejected"),
+      forceRefresh: async () => recoveredCreds("rejected"),
+    })
+    assert.equal(
+      recovered,
+      null,
+      "retrying with the rejected token would fail identically",
+    )
+  })
+
+  it("returns null rather than throwing when the reload throws", async () => {
+    const recovered = await helpers.recoverRejectedToken("rejected", "m", {
+      reload: () => {
+        throw new Error("forced reload failure")
+      },
+      forceRefresh: async () => null,
+    })
+    assert.equal(recovered, null)
+  })
+
+  it("falls back to the reload result when the force refresh throws", async () => {
+    // A reload that changed the token is still usable even if the refresh
+    // that would have replaced it blew up.
+    const recovered = await helpers.recoverRejectedToken("rejected", "m", {
+      reload: () => null,
+      forceRefresh: async () => {
+        throw new Error("refresh rejected")
+      },
+    })
+    assert.equal(recovered, null)
+  })
+})
+
+describe("pickUpRotatedToken", () => {
+  it("reports a token replaced since the rate-limited attempt", () => {
+    const rotated = helpers.pickUpRotatedToken("exhausted-token", "m", () =>
+      recoveredCreds("fresh-token"),
+    )
+    assert.equal(rotated?.accessToken, "fresh-token")
+  })
+
+  it("reports nothing when the source still holds the same token", () => {
+    const rotated = helpers.pickUpRotatedToken("exhausted-token", "m", () =>
+      recoveredCreds("exhausted-token"),
+    )
+    assert.equal(rotated, null, "an unchanged token must not be retried")
+  })
+
+  it("reports nothing when the source is unreadable", () => {
+    assert.equal(
+      helpers.pickUpRotatedToken("exhausted-token", "m", () => null),
+      null,
+    )
+  })
+
+  it("returns null rather than throwing when the reload throws", () => {
+    const rotated = helpers.pickUpRotatedToken("exhausted-token", "m", () => {
+      throw new Error("forced reload failure")
+    })
+    assert.equal(rotated, null)
+  })
+})
+
+// --- Proactive refresh timer ------------------------------------------------
+
+describe("proactive refresh timer", () => {
+  it("unrefs the interval so it cannot hold the process open", async () => {
+    const originalSetInterval = globalThis.setInterval
     let unrefCalled = false
-    const fakeTimer = {
+    globalThis.setInterval = (() => ({
       unref() {
         unrefCalled = true
       },
-    }
-    globalThis.setInterval = (() => fakeTimer) as unknown as typeof setInterval
+    })) as unknown as typeof setInterval
 
     try {
-      await helpers.default({} as never)
-      assert.ok(
-        unrefCalled,
-        "Expected .unref() to be called on the interval timer",
-      )
+      const { ctx } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+      assert.ok(unrefCalled, "expected .unref() on the interval timer")
     } finally {
       globalThis.setInterval = originalSetInterval
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
     }
   })
 
-  it("proactive refresh timer targets the ACTIVE account after a switch, not accounts[0]", async () => {
+  it("stops ticking once setup's cleanup runs", async () => {
+    const originalSetInterval = globalThis.setInterval
+    const originalClearInterval = globalThis.clearInterval
+    const timer = { unref() {} }
+    let cleared: unknown
+    globalThis.setInterval = (() => timer) as unknown as typeof setInterval
+    globalThis.clearInterval = ((t: unknown) => {
+      cleared = t
+    }) as unknown as typeof clearInterval
+
+    try {
+      const { ctx } = createFakeContext()
+      const cleanup = await plugin.default.setup(ctx as never)
+      await (cleanup as () => void)()
+      assert.equal(cleared, timer, "cleanup must clear the interval it started")
+    } finally {
+      globalThis.setInterval = originalSetInterval
+      globalThis.clearInterval = originalClearInterval
+    }
+  })
+
+  it("targets the ACTIVE account after a switch, not accounts[0]", async () => {
     const originalSetInterval = globalThis.setInterval
     const originalHome = process.env.HOME
     const originalDebug = process.env.CLAUDE_AUTH_DEBUG
@@ -914,8 +1254,8 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     const debugLogPath = join(tempHome, "debug.log")
     process.env.HOME = tempHome
     // Capture the timer's own log ("proactive_refresh_check") so we can
-    // assert which account it resolved to. The CLAUDE_AUTH_DEBUG env
-    // routes logs to a file (see logger.ts).
+    // assert which account it resolved to. CLAUDE_AUTH_DEBUG routes logs to
+    // a file (see logger.ts).
     process.env.CLAUDE_AUTH_DEBUG = debugLogPath
 
     let tickCallback: (() => void | Promise<void>) | undefined
@@ -938,49 +1278,32 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         bRefreshResult: "success",
       })
 
-      const plugin = await helpersModule.default({} as never)
-      assert.ok(
-        tickCallback,
-        "Expected setInterval to capture the tick callback",
-      )
+      const { ctx, integrationTransforms } = createFakeContext()
+      await helpersModule.default.setup(ctx as never)
+      assert.ok(tickCallback, "expected setInterval to capture the tick")
 
-      const typedPlugin = plugin as {
-        auth?: {
-          methods?: Array<{
-            authorize?: (i: { account?: string }) => Promise<unknown>
-          }>
-        }
-      }
-      await typedPlugin.auth!.methods![0]!.authorize!({ account: "acct-b" })
+      await authorizeVia(integrationTransforms, { account: "acct-b" })
 
       // Truncate the log so we only inspect entries produced by the tick.
       await writeFile(debugLogPath, "", "utf-8")
-
-      // Fire the timer tick manually — this is the only thing that should
-      // trigger a refresh in this scenario.
       await tickCallback!()
 
       const logs = await readFile(debugLogPath, "utf-8")
-      // The fix: timer's proactive_refresh_check should reference the
-      // ACTIVE account (acct-b), not the closure-captured accounts[0]
-      // (acct-a). With the accounts[0] bug, the log would show
-      // "source":"acct-a" here.
-      const proactiveCheckEntries = logs
+      const checks = logs
         .split("\n")
         .filter((line) => line.includes("proactive_refresh_check"))
       assert.ok(
-        proactiveCheckEntries.length > 0,
+        checks.length > 0,
         `Expected proactive_refresh_check log entry, got log: ${logs}`,
       )
       assert.ok(
-        proactiveCheckEntries.some((l) => l.includes('"source":"acct-b"')),
+        checks.some((l) => l.includes('"source":"acct-b"')),
         `Timer should resolve ACTIVE account (acct-b) after switch, not ` +
           `accounts[0] (acct-a). Log: ${logs}`,
       )
       assert.ok(
-        !proactiveCheckEntries.some((l) => l.includes('"source":"acct-a"')),
-        "Timer should NOT be checking accounts[0] after switch. " +
-          `Log: ${logs}`,
+        !checks.some((l) => l.includes('"source":"acct-a"')),
+        `Timer should NOT be checking accounts[0] after switch. Log: ${logs}`,
       )
     } finally {
       globalThis.setInterval = originalSetInterval
@@ -997,7 +1320,7 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     }
   })
 
-  it("proactive refresh timer warns at most once per outage (no spam on repeated failures)", async () => {
+  it("warns at most once per outage (no spam on repeated failures)", async () => {
     const originalSetInterval = globalThis.setInterval
     const originalHome = process.env.HOME
     const originalWarn = console.warn
@@ -1017,11 +1340,9 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
 
     try {
       const { helpersModule } = await loadHelpersWithMultiAccountKeychain({
-        // Set acct-a to ALREADY EXPIRED so upstream's tryFallbackAccount
-        // cannot borrow its creds when acct-b's refresh fails. Without
-        // this, the new fallback would return acct-a's still-valid creds
-        // and refreshIfNeeded would return non-null — making the warn
-        // path unreachable and the latch untestable.
+        // acct-a ALREADY EXPIRED so the fallback cannot borrow its creds
+        // when acct-b's refresh fails. Otherwise refreshIfNeeded returns
+        // non-null, the warn path is unreachable and the latch untestable.
         aExpiresAt: Date.now() - 60_000,
         // Inside the reactive window, so the refresh chain runs to
         // exhaustion instead of short-circuiting on still-usable creds.
@@ -1029,23 +1350,15 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         bRefreshResult: "fail",
       })
 
-      const plugin = await helpersModule.default({} as never)
+      const { ctx, integrationTransforms } = createFakeContext()
+      await helpersModule.default.setup(ctx as never)
       assert.ok(tickCallback)
 
-      const typedPlugin = plugin as {
-        auth?: {
-          methods?: Array<{
-            authorize?: (i: { account?: string }) => Promise<unknown>
-          }>
-        }
-      }
-      await typedPlugin.auth!.methods![0]!.authorize!({ account: "acct-b" })
+      await authorizeVia(integrationTransforms, { account: "acct-b" })
+      warnMessages.length = 0 // ignore warnings from init/authorize
 
-      warnMessages.length = 0 // ignore any warnings emitted during init/authorize
-
-      // Simulate 3 consecutive failed sync ticks (15 minutes of downtime).
-      // Awaited individually: real ticks are 5 minutes apart, so each one
-      // completes long before the next fires.
+      // Three consecutive failed ticks (15 minutes of downtime). Awaited
+      // individually: real ticks are 5 minutes apart.
       await tickCallback!()
       await tickCallback!()
       await tickCallback!()
@@ -1068,100 +1381,367 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
       }
     }
   })
+})
 
-  it("auth fetch forwards original input URL unchanged", async () => {
-    const originalNow = Date.now
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const originalFetch = globalThis.fetch
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    Date.now = () => 1_700_000_000_000
-    globalThis.setInterval = (() => ({
-      unref() {},
-    })) as unknown as typeof setInterval
+describe("parseRetryAfterMs", () => {
+  it("converts seconds to milliseconds", () => {
+    assert.equal(helpers.parseRetryAfterMs("5"), 5_000)
+  })
 
-    let forwardedInput: RequestInfo | URL | undefined
+  it("returns undefined for a missing or non-numeric header", () => {
+    assert.equal(helpers.parseRetryAfterMs(null), undefined)
+    assert.equal(helpers.parseRetryAfterMs("not-a-number"), undefined)
+  })
+})
 
-    try {
-      const { helpersModule } = await loadHelpersWithCountingKeychain(
-        Date.now() + 10 * 60_000,
+// --- Plugin setup against a fake v2 context ---------------------------------
+
+describe("plugin setup", () => {
+  it("exposes a stable plugin id and a setup function", () => {
+    assert.equal(plugin.default.id, "opencode-claude-auth")
+    assert.equal(typeof plugin.default.setup, "function")
+  })
+
+  it("registers every session hook scoped to the anthropic provider", async () => {
+    const { ctx, hooks } = createFakeContext()
+    await plugin.default.setup(ctx as never)
+
+    const names = new Set(hooks.map((hook) => hook.name))
+    for (const expected of [
+      "context",
+      "compaction",
+      "generate",
+      "title",
+      "http.request",
+      "http.response",
+      "retry",
+    ]) {
+      assert.ok(names.has(expected), `missing hook: ${expected}`)
+    }
+
+    for (const hook of hooks) {
+      assert.equal(
+        hook.options?.providerID,
+        "anthropic",
+        `hook ${hook.name} should be scoped to anthropic`,
       )
-      globalThis.fetch = (async (input: RequestInfo | URL) => {
-        forwardedInput = input
-        return new Response("ok")
-      }) as typeof fetch
-
-      const plugin = await helpersModule.default({} as never)
-      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
-      assert.equal(typeof typedPlugin.auth?.loader, "function")
-      const authConfig = await typedPlugin.auth!.loader!(
-        async () => ({
-          type: "oauth",
-          refresh: "refresh",
-          access: "access",
-          expires: Date.now() + 60_000,
-        }),
-        { models: {} },
-      )
-
-      const originalInput = "https://api.anthropic.com/v1/messages"
-      await authConfig.fetch(originalInput, {
-        method: "POST",
-        body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
-      })
-
-      assert.equal(forwardedInput, `${originalInput}?beta=true`)
-    } finally {
-      Date.now = originalNow
-      globalThis.setInterval = originalSetInterval
-      globalThis.fetch = originalFetch
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
     }
   })
 
-  it("auth fetch reloads the source and retries once with a rotated token", async () => {
-    const originalNow = Date.now
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const originalFetch = globalThis.fetch
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    Date.now = () => 1_700_000_000_000
-    globalThis.setInterval = (() => ({
-      unref() {},
-    })) as unknown as typeof setInterval
+  it("setup returns a cleanup function", async () => {
+    const { ctx } = createFakeContext()
+    const cleanup = await plugin.default.setup(ctx as never)
+    assert.equal(typeof cleanup, "function")
+    await (cleanup as () => void)()
+  })
 
-    const authorizationHeaders: string[] = []
+  describe("context hook", () => {
+    it("injects the Claude Code identity prefix", async () => {
+      const { ctx, hooks } = createFakeContext()
+      await plugin.default.setup(ctx as never)
 
-    try {
-      const { helpersModule, keychainModule } =
-        await loadHelpersWithCountingKeychain(Date.now() + 10 * 60_000)
-      globalThis.fetch = (async (_input, init) => {
-        authorizationHeaders.push(
-          new Headers(init?.headers).get("authorization") ?? "",
-        )
-        return authorizationHeaders.length === 1
-          ? new Response("revoked", { status: 401 })
-          : new Response("ok", { status: 200 })
-      }) as typeof fetch
+      const event = { system: [{ type: "text", text: "Existing instruction" }] }
+      await findHook(hooks, "context").callback(event)
 
-      const plugin = await helpersModule.default({} as never)
-      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
-      assert.equal(typeof typedPlugin.auth?.loader, "function")
-      const authConfig = await typedPlugin.auth!.loader!(
-        async () => ({
-          type: "oauth",
-          refresh: "refresh",
-          access: "access",
-          expires: Date.now() + 60_000,
-        }),
-        { models: {} },
+      assert.equal(event.system.length, 2)
+      assert.equal(
+        event.system[0].text,
+        "You are Claude Code, Anthropic's official CLI for Claude.",
       )
+    })
+
+    it("does not inject when the prefix is already present", async () => {
+      const { ctx, hooks } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+
+      const prefixed =
+        "You are Claude Code, Anthropic's official CLI for Claude.\n\nExisting"
+      const event = { system: [{ type: "text", text: prefixed }] }
+      await findHook(hooks, "context").callback(event)
+
+      assert.deepEqual(event.system, [{ type: "text", text: prefixed }])
+    })
+
+    it("applies to title and compaction requests too", async () => {
+      const { ctx, hooks } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+
+      for (const name of ["title", "compaction", "generate"]) {
+        const event = { system: [] as Array<{ type: string; text?: string }> }
+        await findHook(hooks, name).callback(event)
+        assert.equal(event.system.length, 1, `${name} should inject identity`)
+      }
+    })
+  })
+
+  describe("http.request hook", () => {
+    it("adds beta=true, sets bearer auth and transforms the body", async () => {
+      const { ctx, hooks } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+
+      const event = {
+        sessionID: "s1",
+        kind: "primary",
+        model: { id: "claude-haiku-4-5", providerID: "anthropic" },
+        request: new Request("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: { "x-api-key": "should-be-stripped" },
+          body: JSON.stringify({
+            model: "claude-haiku-4-5",
+            messages: [{ role: "user", content: "hey" }],
+            tools: [{ name: "bash" }],
+          }),
+        }),
+      }
+
+      await findHook(hooks, "http.request").callback(event)
+
+      assert.equal(
+        event.request.url,
+        "https://api.anthropic.com/v1/messages?beta=true",
+      )
+      assert.equal(event.request.headers.get("authorization"), "Bearer token")
+      assert.equal(event.request.headers.get("x-api-key"), null)
+      assert.equal(event.request.headers.get("x-app"), "cli")
+
+      const sent = JSON.parse(await event.request.text()) as {
+        tools: Array<{ name: string }>
+        system: Array<{ text: string }>
+      }
+      assert.equal(
+        sent.tools[0].name,
+        "mcp_Bash",
+        "tool names should be prefixed and PascalCased",
+      )
+      assert.ok(
+        sent.system[0].text.startsWith("x-anthropic-billing-header"),
+        "billing header should be injected as system[0]",
+      )
+    })
+
+    it("does not attach a body to a GET request", async () => {
+      const { ctx, hooks } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+
+      const event = {
+        sessionID: "s1",
+        kind: "primary",
+        model: { id: "claude-haiku-4-5", providerID: "anthropic" },
+        request: new Request("https://api.anthropic.com/v1/models"),
+      }
+
+      await findHook(hooks, "http.request").callback(event)
+
+      assert.equal(event.request.method, "GET")
+      assert.equal(event.request.body, null)
+      assert.equal(event.request.url, "https://api.anthropic.com/v1/models")
+    })
+
+    it("throws an actionable error when credentials are unavailable", async () => {
+      const expired = await loadPluginModule("1")
+      const { ctx, hooks } = createFakeContext()
+      await expired.default.setup(ctx as never)
+
+      const event = {
+        sessionID: "s1",
+        kind: "primary",
+        model: { id: "claude-haiku-4-5", providerID: "anthropic" },
+        request: new Request("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          body: "{}",
+        }),
+      }
+
+      await assert.rejects(
+        async () => findHook(hooks, "http.request").callback(event),
+        /Run `claude` to refresh them/,
+      )
+    })
+  })
+
+  describe("http.response hook", () => {
+    it("strips the mcp_ tool prefix out of the stream", async () => {
+      const { ctx, hooks } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+
+      const event = {
+        sessionID: "s1",
+        kind: "primary",
+        model: { id: "claude-haiku-4-5", providerID: "anthropic" },
+        request: new Request("https://api.anthropic.com/v1/messages"),
+        response: new Response(
+          `event: content_block_start\ndata: {"name": "mcp_Bash"}\n\n`,
+          { status: 200 },
+        ),
+      }
+
+      await findHook(hooks, "http.response").callback(event)
+
+      const text = await event.response.text()
+      assert.ok(text.includes(`"name": "bash"`), `got: ${text}`)
+      assert.ok(!text.includes("mcp_Bash"))
+    })
+
+    it("leaves a 401 body alone (it carries an error, not an SSE stream)", async () => {
+      const { ctx, hooks } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+
+      const body = JSON.stringify({
+        type: "error",
+        error: { type: "authentication_error", message: "revoked" },
+      })
+      const original = new Response(body, { status: 401 })
+      const event = {
+        sessionID: "s1",
+        kind: "primary",
+        model: { id: "claude-haiku-4-5", providerID: "anthropic" },
+        request: new Request("https://api.anthropic.com/v1/messages"),
+        response: original,
+      }
+
+      await findHook(hooks, "http.response").callback(event)
+
+      assert.equal(event.response, original, "a 401 must pass through as-is")
+      assert.equal(await event.response.text(), body)
+    })
+
+    it("captures retry-after so the retry hook can use it", async () => {
+      const { ctx, hooks } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+
+      const sessionID = "s-retry-after"
+      await findHook(hooks, "http.response").callback({
+        sessionID,
+        kind: "primary",
+        model: { id: "claude-haiku-4-5", providerID: "anthropic" },
+        request: new Request("https://api.anthropic.com/v1/messages"),
+        response: new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "7" },
+        }),
+      })
+
+      const event = {
+        sessionID,
+        agent: "build",
+        model: { id: "claude-haiku-4-5", providerID: "anthropic" },
+        error: { type: "api_error", message: "rate limited", status: 429 },
+        attempt: 1,
+        decision: { retry: false } as { retry: boolean; delay?: number },
+      }
+      await findHook(hooks, "retry").callback(event)
+
+      // 7s from the header, not the 2s attempt-based fallback.
+      assert.deepEqual(event.decision, { retry: true, delay: 7_000 })
+    })
+  })
+
+  describe("retry hook", () => {
+    it("leaves OpenCode's decision untouched for unrelated failures", async () => {
+      const { ctx, hooks } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+
+      const event = retryEvent({ status: 500 })
+      await findHook(hooks, "retry").callback(event)
+      assert.deepEqual(event.decision, { retry: false })
+    })
+
+    it("refuses to retry a 401 when no different token can be produced", async () => {
+      // The stubbed keychain always hands back the same credential, so
+      // recovery cannot progress — exactly the case where v1 surfaced the
+      // original 401 instead of burning another request on it.
+      const { ctx, hooks } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+
+      const sessionID = "s-401"
+      // Send a request first: recovery compares against the token this
+      // session actually used, which only http.request records.
+      await sendRequest(hooks, sessionID)
+
+      const event = retryEvent({ status: 401, sessionID })
+      await findHook(hooks, "retry").callback(event)
+      assert.deepEqual(event.decision, { retry: false })
+    })
+
+    it("retries a 401 that failed before any token was recorded", async () => {
+      // Nothing to compare against, so the policy decision stands and the
+      // next attempt rebuilds from current credentials.
+      const { ctx, hooks } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+
+      const event = retryEvent({ status: 401, sessionID: "s-401-early" })
+      await findHook(hooks, "retry").callback(event)
+      assert.deepEqual(event.decision, { retry: true, delay: 0 })
+    })
+
+    it("backs off on a 429 whose token has not rotated", async () => {
+      const { ctx, hooks } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+
+      const event = retryEvent({ status: 429, attempt: 2 })
+      await findHook(hooks, "retry").callback(event)
+      assert.deepEqual(event.decision, { retry: true, delay: 4_000 })
+    })
+
+    it("drops a long-context beta instead of treating a 429 as a rate limit", async () => {
+      const { ctx, hooks } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+      plugin.resetExcludedBetas()
+
+      const event = retryEvent({
+        status: 429,
+        body: "long context beta is not yet available",
+      })
+      await findHook(hooks, "retry").callback(event)
+
+      assert.deepEqual(
+        event.decision,
+        { retry: true, delay: 0 },
+        "a header problem retries immediately, with no backoff",
+      )
+      assert.ok(
+        plugin.getExcludedBetas("claude-haiku-4-5").size > 0,
+        "the retry must differ from the attempt that just failed",
+      )
+    })
+
+    // The suites above inject the credential lookups. These two run through
+    // the real reloadCredentialsFromSource / forceRefreshActiveAccount, which
+    // is the only thing that proves the default wiring is connected.
+    it("retries a 429 without backoff once the source token has rotated", async () => {
+      const { helpersModule, keychainModule } =
+        await loadPluginWithKeychainControls()
+      const { ctx, hooks } = createFakeContext()
+      await helpersModule.default.setup(ctx as never)
+
+      const sessionID = "s-429-rotated"
+      await sendRequest(hooks, sessionID)
+
+      // Another process switched accounts while we were rate-limited.
+      keychainModule.__setCredentials({
+        accessToken: "rotated-token",
+        refreshToken: "rotated-refresh",
+        expiresAt: Date.now() + 8 * 60 * 60_000,
+      })
+
+      const event = retryEvent({ status: 429, sessionID, attempt: 2 })
+      await findHook(hooks, "retry").callback(event)
+
+      assert.deepEqual(
+        event.decision,
+        { retry: true, delay: 0 },
+        "a limit already resolved elsewhere needs no backoff",
+      )
+    })
+
+    it("recovers a 401 from a token rotated into the source", async () => {
+      const { helpersModule, keychainModule } =
+        await loadPluginWithKeychainControls()
+      const { ctx, hooks } = createFakeContext()
+      await helpersModule.default.setup(ctx as never)
+
+      const sessionID = "s-401-rotated"
+      await sendRequest(hooks, sessionID)
 
       keychainModule.__setCredentials({
         accessToken: "replacement-token",
@@ -1169,940 +1749,227 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         expiresAt: Date.now() + 8 * 60 * 60_000,
       })
 
-      const response = await authConfig.fetch(
-        "https://api.anthropic.com/v1/messages",
-        {
-          method: "POST",
-          body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
-        },
-      )
+      const event = retryEvent({ status: 401, sessionID })
+      await findHook(hooks, "retry").callback(event)
 
-      assert.equal(response.status, 200)
-      assert.deepEqual(authorizationHeaders, [
-        "Bearer token",
-        "Bearer replacement-token",
-      ])
-    } finally {
-      Date.now = originalNow
-      globalThis.setInterval = originalSetInterval
-      globalThis.fetch = originalFetch
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
-    }
-  })
-
-  it("auth fetch force-refreshes on a 401 when the source token is unchanged", async () => {
-    const originalNow = Date.now
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const originalFetch = globalThis.fetch
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    Date.now = () => 1_700_000_000_000
-    globalThis.setInterval = (() => ({
-      unref() {},
-    })) as unknown as typeof setInterval
-
-    let apiCalls = 0
-    let oauthCalls = 0
-
-    try {
-      const { helpersModule } = await loadHelpersWithCountingKeychain(
-        Date.now() + 10 * 60_000,
-      )
-
-      globalThis.fetch = (async (input: RequestInfo | URL) => {
-        const url = typeof input === "string" ? input : String(input)
-        if (url.includes("/oauth/token")) {
-          oauthCalls += 1
-          return new Response(
-            JSON.stringify({
-              access_token: "recovered-token",
-              refresh_token: "rt-recovered",
-              expires_in: 36_000,
-            }),
-            { status: 200 },
-          )
-        }
-        apiCalls += 1
-        return apiCalls === 1
-          ? new Response('{"error":"expired"}', { status: 401 })
-          : new Response("data: {}\n\n", { status: 200 })
-      }) as typeof fetch
-
-      const plugin = await helpersModule.default({} as never)
-      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
-      const authConfig = await typedPlugin.auth!.loader!(
-        async () => ({
-          type: "oauth",
-          refresh: "refresh",
-          access: "access",
-          expires: Date.now() + 60_000,
-        }),
-        { models: {} },
-      )
-
-      const response = await authConfig.fetch(
-        "https://api.anthropic.com/v1/messages",
-        {
-          method: "POST",
-          body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
-        },
-      )
-
-      assert.equal(response.status, 200)
-      assert.equal(oauthCalls, 1, "the unchanged token must force a refresh")
-      assert.equal(apiCalls, 2, "the refreshed token must be retried once")
-    } finally {
-      Date.now = originalNow
-      globalThis.setInterval = originalSetInterval
-      globalThis.fetch = originalFetch
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
-    }
-  })
-
-  it("auth fetch surfaces the 401 unchanged when recovery cannot progress", async () => {
-    const originalNow = Date.now
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const originalFetch = globalThis.fetch
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    Date.now = () => 1_700_000_000_000
-    globalThis.setInterval = (() => ({
-      unref() {},
-    })) as unknown as typeof setInterval
-
-    let apiCalls = 0
-    const errorBody = '{"name":"mcp_UnchangedToken"}'
-
-    try {
-      const { helpersModule } = await loadHelpersWithCountingKeychain(
-        Date.now() + 10 * 60_000,
-      )
-
-      globalThis.fetch = (async (input: RequestInfo | URL) => {
-        const url = typeof input === "string" ? input : String(input)
-        if (url.includes("/oauth/token")) {
-          // A 429 from the token endpoint must read as a failed refresh, not
-          // as something that loops account recovery. retry-after beyond the
-          // 30s cap makes fetchWithRetry return instead of backing off.
-          return new Response('{"error":"rate_limited"}', {
-            status: 429,
-            headers: { "retry-after": "3600" },
-          })
-        }
-        apiCalls += 1
-        return new Response(errorBody, {
-          status: 401,
-          headers: { "x-request-id": "unchanged-token-401" },
-        })
-      }) as typeof fetch
-
-      const plugin = await helpersModule.default({} as never)
-      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
-      const authConfig = await typedPlugin.auth!.loader!(
-        async () => ({
-          type: "oauth",
-          refresh: "refresh",
-          access: "access",
-          expires: Date.now() + 60_000,
-        }),
-        { models: {} },
-      )
-
-      const response = await authConfig.fetch(
-        "https://api.anthropic.com/v1/messages",
-        {
-          method: "POST",
-          body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
-        },
-      )
-
-      assert.equal(response.status, 401)
-      assert.equal(response.headers.get("x-request-id"), "unchanged-token-401")
-      assert.equal(await response.text(), errorBody)
-      assert.equal(apiCalls, 1, "no retry without a different token")
-    } finally {
-      Date.now = originalNow
-      globalThis.setInterval = originalSetInterval
-      globalThis.fetch = originalFetch
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
-    }
-  })
-
-  it("auth fetch makes a second recovery attempt when the first retry is also rejected", async () => {
-    const originalNow = Date.now
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const originalFetch = globalThis.fetch
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    Date.now = () => 1_700_000_000_000
-    globalThis.setInterval = (() => ({
-      unref() {},
-    })) as unknown as typeof setInterval
-
-    let apiCalls = 0
-    let oauthCalls = 0
-
-    try {
-      const { helpersModule, keychainModule } =
-        await loadHelpersWithCountingKeychain(Date.now() + 10 * 60_000)
-
-      globalThis.fetch = (async (input: RequestInfo | URL) => {
-        const url = typeof input === "string" ? input : String(input)
-        if (url.includes("/oauth/token")) {
-          oauthCalls += 1
-          return new Response(
-            JSON.stringify({
-              access_token: "second-stage-token",
-              refresh_token: "rt-second-stage",
-              expires_in: 36_000,
-            }),
-            { status: 200 },
-          )
-        }
-        apiCalls += 1
-        // Calls 1 and 2 are rejected; only the force-refreshed token works.
-        return apiCalls <= 2
-          ? new Response('{"error":"expired"}', { status: 401 })
-          : new Response("data: {}\n\n", { status: 200 })
-      }) as typeof fetch
-
-      const plugin = await helpersModule.default({} as never)
-      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
-      const authConfig = await typedPlugin.auth!.loader!(
-        async () => ({
-          type: "oauth",
-          refresh: "refresh",
-          access: "access",
-          expires: Date.now() + 60_000,
-        }),
-        { models: {} },
-      )
-
-      // Attempt 1's reload finds a different, still-valid-looking token.
-      keychainModule.__setCredentials({
-        accessToken: "concurrently-rotated",
-        refreshToken: "rt-concurrent",
-        expiresAt: Date.now() + 10 * 60_000,
-      })
-
-      const response = await authConfig.fetch(
-        "https://api.anthropic.com/v1/messages",
-        {
-          method: "POST",
-          body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
-        },
-      )
-
-      assert.equal(response.status, 200)
-      assert.equal(apiCalls, 3, "original, reload retry, force-refresh retry")
-      assert.equal(oauthCalls, 1, "only the second attempt force-refreshes")
-    } finally {
-      Date.now = originalNow
-      globalThis.setInterval = originalSetInterval
-      globalThis.fetch = originalFetch
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
-    }
-  })
-
-  it("auth fetch preserves the original 401 when credential reload throws", async () => {
-    const originalNow = Date.now
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const originalFetch = globalThis.fetch
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    Date.now = () => 1_700_000_000_000
-    globalThis.setInterval = (() => ({
-      unref() {},
-    })) as unknown as typeof setInterval
-
-    let apiCalls = 0
-    let oauthCalls = 0
-    const errorBody = '{"name":"mcp_ReloadFailure"}'
-
-    try {
-      const { helpersModule } = await loadHelpersWithCountingKeychain(
-        Date.now() + 10 * 60_000,
-        { throwOnReload: true },
-      )
-      globalThis.fetch = (async (input: RequestInfo | URL) => {
-        const url = typeof input === "string" ? input : String(input)
-        // A thrown reload leaves no candidate, so the loop falls through to
-        // the force refresh. Rejecting it here is what makes recovery
-        // terminal and surfaces the original 401 untouched.
-        if (url.includes("/oauth/token")) {
-          oauthCalls += 1
-          return new Response('{"error":"invalid_grant"}', { status: 401 })
-        }
-        apiCalls += 1
-        return new Response(errorBody, {
-          status: 401,
-          statusText: "Unauthorized",
-          headers: {
-            "content-type": "text/plain",
-            "x-request-id": "request-401",
-          },
-        })
-      }) as typeof fetch
-
-      const plugin = await helpersModule.default({} as never)
-      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
-      assert.equal(typeof typedPlugin.auth?.loader, "function")
-      const authConfig = await typedPlugin.auth!.loader!(
-        async () => ({
-          type: "oauth",
-          refresh: "refresh",
-          access: "access",
-          expires: Date.now() + 60_000,
-        }),
-        { models: {} },
-      )
-
-      const response = await authConfig.fetch(
-        "https://api.anthropic.com/v1/messages",
-        {
-          method: "POST",
-          body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
-        },
-      )
-
-      assert.equal(response.status, 401)
-      assert.equal(response.statusText, "Unauthorized")
-      assert.equal(response.headers.get("content-type"), "text/plain")
-      assert.equal(response.headers.get("x-request-id"), "request-401")
-      assert.equal(await response.text(), errorBody)
-      assert.equal(apiCalls, 1, "no retry once recovery cannot progress")
-      assert.equal(oauthCalls, 1, "a thrown reload still forces a refresh")
-    } finally {
-      Date.now = originalNow
-      globalThis.setInterval = originalSetInterval
-      globalThis.fetch = originalFetch
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
-    }
-  })
-
-  it("auth fetch returns quota errors without writing over the terminal UI", async () => {
-    const originalNow = Date.now
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const originalFetch = globalThis.fetch
-    const originalWarn = console.warn
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    Date.now = () => 1_700_000_000_000
-    globalThis.setInterval = (() => ({
-      unref() {},
-    })) as unknown as typeof setInterval
-
-    const errorBody = JSON.stringify({
-      type: "error",
-      error: {
-        type: "rate_limit_error",
-        message:
-          "This request would exceed your account's rate limit. Please try again later.",
-      },
+      assert.deepEqual(event.decision, { retry: true, delay: 0 })
     })
-    let fetchCount = 0
-    const warnings: unknown[][] = []
+  })
 
-    try {
-      const { helpersModule } = await loadHelpersWithCountingKeychain(
-        Date.now() + 10 * 60_000,
-      )
-      globalThis.fetch = (async () => {
-        fetchCount += 1
-        return new Response(errorBody, {
-          status: 429,
-          headers: {
-            "content-type": "application/json",
-            "retry-after": "11218",
+  describe("model.transform", () => {
+    it("zeroes the cost of every anthropic model", async () => {
+      const { ctx, modelTransforms } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+      assert.equal(modelTransforms.length, 1)
+
+      const model = {
+        id: "claude-sonnet-4-6",
+        cost: [
+          {
+            input: 3,
+            output: 15,
+            cache: { read: 0.3, write: 3.75 },
+            tier: { type: "context", size: 200_000 },
           },
-        })
-      }) as typeof fetch
-      console.warn = (...args: unknown[]) => {
-        warnings.push(args)
+        ],
       }
 
-      const plugin = await helpersModule.default({} as never)
-      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
-      assert.equal(typeof typedPlugin.auth?.loader, "function")
-      const authConfig = await typedPlugin.auth!.loader!(
-        async () => ({
-          type: "oauth",
-          refresh: "refresh",
-          access: "access",
-          expires: Date.now() + 60_000,
-        }),
-        { models: {} },
-      )
-
-      const response = await authConfig.fetch(
-        "https://api.anthropic.com/v1/messages",
-        {
-          method: "POST",
-          body: JSON.stringify({
-            model: "claude-opus-4-8",
-            messages: [],
-          }),
+      const editor = {
+        provider: {
+          get: (providerID: string) =>
+            providerID === "anthropic"
+              ? { models: new Map([[model.id, model]]) }
+              : undefined,
         },
-      )
-
-      assert.equal(response.status, 429)
-      assert.equal(response.headers.get("retry-after"), "11218")
-      assert.equal(await response.text(), errorBody)
-      await new Promise<void>((resolve) => setImmediate(resolve))
-      assert.equal(fetchCount, 1)
-      assert.deepEqual(warnings, [])
-    } finally {
-      Date.now = originalNow
-      globalThis.setInterval = originalSetInterval
-      globalThis.fetch = originalFetch
-      console.warn = originalWarn
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
+        update: (
+          _providerID: string,
+          _modelID: string,
+          update: (m: typeof model) => void,
+        ) => update(model),
       }
-    }
+
+      modelTransforms[0](editor)
+
+      assert.deepEqual(model.cost, [
+        {
+          input: 0,
+          output: 0,
+          cache: { read: 0, write: 0 },
+          tier: { type: "context", size: 200_000 },
+        },
+      ])
+    })
+
+    it("is a no-op when the anthropic provider is absent", async () => {
+      const { ctx, modelTransforms } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+
+      assert.doesNotThrow(() =>
+        modelTransforms[0]({
+          provider: { get: () => undefined },
+          update: () => assert.fail("should not update any model"),
+        }),
+      )
+    })
   })
 
-  it("auth fetch stops at the recovery attempt cap when the store rotates on every read", async () => {
-    const originalNow = Date.now
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const originalFetch = globalThis.fetch
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    Date.now = () => 1_700_000_000_000
-    globalThis.setInterval = (() => ({
-      unref() {},
-    })) as unknown as typeof setInterval
+  describe("integration.transform", () => {
+    it("registers an oauth method on the anthropic integration", async () => {
+      const { ctx, integrationTransforms } = createFakeContext()
+      await plugin.default.setup(ctx as never)
+      assert.equal(integrationTransforms.length, 1)
 
-    // Against a store rotated on every read, every candidate differs from the
-    // token in use, so the no-progress break never fires and the attempt cap
-    // is the only thing stopping the loop. Nothing else pins that ceiling —
-    // the two-attempt test exits via success, so it constrains the floor.
-    const authorizationHeaders: string[] = []
+      const registrations: Array<Record<string, unknown>> = []
+      integrationTransforms[0]({
+        method: { update: (input: never) => registrations.push(input) },
+      })
 
-    try {
-      const { helpersModule, keychainModule } =
-        await loadHelpersWithCountingKeychain(Date.now() + 10 * 60_000)
+      assert.equal(registrations.length, 1)
+      const registration = registrations[0] as {
+        integrationID: string
+        method: { id: string; type: string; form?: unknown }
+        authorize: (answer: unknown) => Promise<unknown>
+        refresh: () => Promise<unknown>
+      }
 
-      globalThis.fetch = (async (_input, init) => {
-        authorizationHeaders.push(
-          new Headers(init?.headers).get("authorization") ?? "",
-        )
-        // Rotate the store before answering, so the next reload always finds
-        // a token it has not seen.
-        keychainModule.__setCredentials({
-          accessToken: `rotated-${authorizationHeaders.length}`,
-          refreshToken: `rt-${authorizationHeaders.length}`,
-          expiresAt: Date.now() + 10 * 60_000,
-        })
-        return new Response('{"error":"expired"}', { status: 401 })
-      }) as typeof fetch
-
-      const plugin = await helpersModule.default({} as never)
-      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
-      const authConfig = await typedPlugin.auth!.loader!(
-        async () => ({
-          type: "oauth",
-          refresh: "refresh",
-          access: "access",
-          expires: Date.now() + 60_000,
-        }),
-        { models: {} },
-      )
-
-      const response = await authConfig.fetch(
-        "https://api.anthropic.com/v1/messages",
-        {
-          method: "POST",
-          body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
-        },
-      )
-
-      assert.equal(response.status, 401)
+      assert.equal(registration.integrationID, "anthropic")
+      assert.equal(registration.method.type, "oauth")
+      assert.equal(registration.method.id, "claude-code")
       assert.equal(
-        authorizationHeaders.length,
-        3,
-        "original request plus two capped recovery attempts, and no more",
+        registration.method.form,
+        undefined,
+        "a single account needs no picker",
       )
-    } finally {
-      Date.now = originalNow
-      globalThis.setInterval = originalSetInterval
-      globalThis.fetch = originalFetch
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
-    }
-  })
+    })
 
-  it("auth fetch compares the 429 re-read against the recovered token, not the original", async () => {
-    const originalNow = Date.now
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const originalFetch = globalThis.fetch
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    Date.now = () => 1_700_000_000_000
-    globalThis.setInterval = (() => ({
-      unref() {},
-    })) as unknown as typeof setInterval
+    it("authorize returns an oauth credential for the chosen account", async () => {
+      const { ctx, integrationTransforms } = createFakeContext()
+      await plugin.default.setup(ctx as never)
 
-    // 401 -> recover -> the retry comes back 429. The 429 block must compare
-    // the source against the token it just recovered with. Comparing against
-    // the original `latest` instead still compiles and passes every other
-    // test, while retrying a quota error on a token the source already agrees
-    // is current — the exact hazard the block's own comment predicts.
-    const authorizationHeaders: string[] = []
-
-    try {
-      const { helpersModule, keychainModule } =
-        await loadHelpersWithCountingKeychain(Date.now() + 10 * 60_000)
-
-      globalThis.fetch = (async (_input, init) => {
-        authorizationHeaders.push(
-          new Headers(init?.headers).get("authorization") ?? "",
-        )
-        if (authorizationHeaders.length === 1) {
-          return new Response('{"error":"expired"}', { status: 401 })
-        }
-        return new Response('{"error":"rate_limited"}', {
-          status: 429,
-          headers: { "retry-after": "3600" },
-        })
-      }) as typeof fetch
-
-      const plugin = await helpersModule.default({} as never)
-      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
-      const authConfig = await typedPlugin.auth!.loader!(
-        async () => ({
-          type: "oauth",
-          refresh: "refresh",
-          access: "access",
-          expires: Date.now() + 60_000,
-        }),
-        { models: {} },
-      )
-
-      // The store already holds the token the 401 recovery will adopt, so
-      // once recovered there is nothing further to rotate to.
-      keychainModule.__setCredentials({
-        accessToken: "recovered-token",
-        refreshToken: "rt-recovered",
-        expiresAt: Date.now() + 10 * 60_000,
+      const registrations: Array<Record<string, unknown>> = []
+      integrationTransforms[0]({
+        method: { update: (input: never) => registrations.push(input) },
       })
 
-      const response = await authConfig.fetch(
-        "https://api.anthropic.com/v1/messages",
-        {
-          method: "POST",
-          body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
-        },
-      )
-
-      assert.equal(response.status, 429)
-      assert.deepEqual(
-        authorizationHeaders,
-        ["Bearer token", "Bearer recovered-token"],
-        "the 429 must not be retried once the source agrees with the token in use",
-      )
-    } finally {
-      Date.now = originalNow
-      globalThis.setInterval = originalSetInterval
-      globalThis.fetch = originalFetch
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
+      const registration = registrations[0] as unknown as {
+        authorize: (answer: unknown) => Promise<{
+          url: string
+          instructions: string
+          mode: string
+          callback: Promise<{
+            type: string
+            access: string
+            refresh: string
+            expires: number
+          }>
+        }>
       }
-    }
-  })
 
-  it("auth fetch retries a 429 once when the source token changed", async () => {
-    const originalNow = Date.now
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const originalFetch = globalThis.fetch
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    Date.now = () => 1_700_000_000_000
-    globalThis.setInterval = (() => ({
-      unref() {},
-    })) as unknown as typeof setInterval
+      const result = await registration.authorize({})
+      assert.equal(result.url, "")
+      assert.equal(result.mode, "auto")
+      assert.match(result.instructions, /Account 1/)
 
-    // Captured per call, not just counted: a count alone cannot tell a
-    // retry that carried the rotated token from one that replayed the
-    // exhausted token, which is the whole behavior under test.
-    const authorizationHeaders: string[] = []
+      const credential = await result.callback
+      assert.equal(credential.type, "oauth")
+      assert.equal(credential.access, "token")
+      assert.equal(credential.refresh, "refresh")
+    })
 
-    try {
-      const { helpersModule, keychainModule } =
-        await loadHelpersWithCountingKeychain(Date.now() + 10 * 60_000)
+    it("refresh surfaces current credentials", async () => {
+      const { ctx, integrationTransforms } = createFakeContext()
+      await plugin.default.setup(ctx as never)
 
-      globalThis.fetch = (async (_input, init) => {
-        authorizationHeaders.push(
-          new Headers(init?.headers).get("authorization") ?? "",
-        )
-        if (authorizationHeaders.length === 1) {
-          // retry-after beyond the 30s cap: quota exhaustion, not a
-          // transient limit, so fetchWithRetry returns immediately.
-          return new Response('{"error":"rate_limited"}', {
-            status: 429,
-            headers: { "retry-after": "3600" },
-          })
-        }
-        return new Response("data: {}\n\n", { status: 200 })
-      }) as typeof fetch
-
-      const plugin = await helpersModule.default({} as never)
-      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
-      const authConfig = await typedPlugin.auth!.loader!(
-        async () => ({
-          type: "oauth",
-          refresh: "refresh",
-          access: "access",
-          expires: Date.now() + 60_000,
-        }),
-        { models: {} },
-      )
-
-      // An external switch lands while this session is still on the
-      // exhausted account.
-      keychainModule.__setCredentials({
-        accessToken: "switched-token",
-        refreshToken: "rt-switched",
-        expiresAt: Date.now() + 10 * 60_000,
+      const registrations: Array<Record<string, unknown>> = []
+      integrationTransforms[0]({
+        method: { update: (input: never) => registrations.push(input) },
       })
 
-      const response = await authConfig.fetch(
-        "https://api.anthropic.com/v1/messages",
-        {
-          method: "POST",
-          body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
-        },
-      )
-
-      assert.equal(response.status, 200)
-      assert.deepEqual(
-        authorizationHeaders,
-        ["Bearer token", "Bearer switched-token"],
-        "the retry must carry the rotated token, not replay the exhausted one",
-      )
-    } finally {
-      Date.now = originalNow
-      globalThis.setInterval = originalSetInterval
-      globalThis.fetch = originalFetch
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
+      const registration = registrations[0] as unknown as {
+        refresh: () => Promise<{ type: string; access: string }>
       }
-    }
-  })
 
-  it("auth fetch does not retry a 429 when the source token is unchanged", async () => {
-    const originalNow = Date.now
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const originalFetch = globalThis.fetch
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    Date.now = () => 1_700_000_000_000
-    globalThis.setInterval = (() => ({
-      unref() {},
-    })) as unknown as typeof setInterval
-
-    let apiCalls = 0
-
-    try {
-      const { helpersModule } = await loadHelpersWithCountingKeychain(
-        Date.now() + 10 * 60_000,
-      )
-
-      globalThis.fetch = (async () => {
-        apiCalls += 1
-        return new Response('{"error":"rate_limited"}', {
-          status: 429,
-          headers: { "retry-after": "3600" },
-        })
-      }) as typeof fetch
-
-      const plugin = await helpersModule.default({} as never)
-      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
-      const authConfig = await typedPlugin.auth!.loader!(
-        async () => ({
-          type: "oauth",
-          refresh: "refresh",
-          access: "access",
-          expires: Date.now() + 60_000,
-        }),
-        { models: {} },
-      )
-
-      const response = await authConfig.fetch(
-        "https://api.anthropic.com/v1/messages",
-        {
-          method: "POST",
-          body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
-        },
-      )
-
-      assert.equal(response.status, 429)
-      assert.equal(apiCalls, 1, "an unchanged token must not be retried")
-    } finally {
-      Date.now = originalNow
-      globalThis.setInterval = originalSetInterval
-      globalThis.fetch = originalFetch
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
-    }
-  })
-
-  it("auth fetch does not retry a 429 when the source is unreadable", async () => {
-    const originalNow = Date.now
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const originalFetch = globalThis.fetch
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    Date.now = () => 1_700_000_000_000
-    globalThis.setInterval = (() => ({
-      unref() {},
-    })) as unknown as typeof setInterval
-
-    let apiCalls = 0
-
-    try {
-      const { helpersModule, keychainModule } =
-        await loadHelpersWithCountingKeychain(Date.now() + 10 * 60_000)
-
-      globalThis.fetch = (async () => {
-        apiCalls += 1
-        return new Response('{"error":"rate_limited"}', {
-          status: 429,
-          headers: { "retry-after": "3600" },
-        })
-      }) as typeof fetch
-
-      const plugin = await helpersModule.default({} as never)
-      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
-      const authConfig = await typedPlugin.auth!.loader!(
-        async () => ({
-          type: "oauth",
-          refresh: "refresh",
-          access: "access",
-          expires: Date.now() + 60_000,
-        }),
-        { models: {} },
-      )
-
-      // Distinct from the unchanged-token arm: the token DID change, but
-      // reloadCredentialsFromSource rejects anything expiring within 60s,
-      // so it yields null. Retrying with a token the reload refused to
-      // vouch for would burn a request on a credential already known bad.
-      keychainModule.__setCredentials({
-        accessToken: "expiring-token",
-        refreshToken: "rt-expiring",
-        expiresAt: Date.now() + 30_000,
-      })
-
-      const response = await authConfig.fetch(
-        "https://api.anthropic.com/v1/messages",
-        {
-          method: "POST",
-          body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
-        },
-      )
-
-      assert.equal(response.status, 429)
-      assert.equal(apiCalls, 1, "an unusable reload must not be retried")
-    } finally {
-      Date.now = originalNow
-      globalThis.setInterval = originalSetInterval
-      globalThis.fetch = originalFetch
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
-    }
+      const credential = await registration.refresh()
+      assert.equal(credential.type, "oauth")
+      assert.equal(credential.access, "token")
+    })
   })
 })
 
-describe("auth hook — account resolution", () => {
-  it("defaults to Account 1 when no input is provided", () => {
-    assert.equal(resolveAccount(accounts, undefined).label, "Account 1")
+// --- Account selection helpers ---------------------------------------------
+
+describe("resolveAccount", () => {
+  it("defaults to Account 1 when no answer is provided", () => {
+    assert.equal(
+      helpers.resolveAccount(accounts, undefined)?.label,
+      "Account 1",
+    )
   })
 
   it("selects Account 2 by its source key", () => {
     assert.equal(
-      resolveAccount(accounts, "Claude Code-credentials-b28bbb7c").label,
+      helpers.resolveAccount(accounts, "Claude Code-credentials-b28bbb7c")
+        ?.label,
       "Account 2",
     )
   })
 
   it("selects Account 3 by its source key", () => {
     assert.equal(
-      resolveAccount(accounts, "Claude Code-credentials-abc123").label,
+      helpers.resolveAccount(accounts, "Claude Code-credentials-abc123")?.label,
       "Account 3",
     )
   })
 
   it("falls back to Account 1 when source doesn't match any account", () => {
     assert.equal(
-      resolveAccount(accounts, "Claude Code-credentials-unknown").label,
+      helpers.resolveAccount(accounts, "Claude Code-credentials-unknown")
+        ?.label,
       "Account 1",
     )
   })
 
+  it("ignores a non-string answer", () => {
+    assert.equal(helpers.resolveAccount(accounts, 42)?.label, "Account 1")
+  })
+
   it("returns the correct credentials for the resolved account", () => {
     assert.equal(
-      resolveAccount(accounts, "Claude Code-credentials-b28bbb7c").credentials
-        .accessToken,
+      helpers.resolveAccount(accounts, "Claude Code-credentials-b28bbb7c")
+        ?.credentials.accessToken,
       "at-2",
     )
   })
 
-  it("works correctly when only one account exists", () => {
-    const single = [
-      {
-        label: "Account 1",
-        source: "Claude Code-credentials",
-        credentials: makeCreds(),
-      },
-    ]
-    assert.equal(resolveAccount(single, undefined).label, "Account 1")
-    assert.equal(resolveAccount(single, "nonexistent").label, "Account 1")
+  it("returns undefined when there are no accounts", () => {
+    assert.equal(helpers.resolveAccount([], "anything"), undefined)
   })
 })
 
-describe("auth hook — select prompt options", () => {
+describe("buildAccountOptions", () => {
   it("builds one option per account", () => {
-    assert.equal(buildSelectOptions(accounts, accounts[0].source).length, 3)
+    assert.equal(
+      helpers.buildAccountOptions(accounts, accounts[0].source).length,
+      3,
+    )
   })
 
   it("uses label as display text and source as value", () => {
-    const options = buildSelectOptions(accounts, accounts[0].source)
+    const options = helpers.buildAccountOptions(accounts, accounts[0].source)
     assert.equal(options[0].label, "Account 1")
     assert.equal(options[0].value, "Claude Code-credentials")
     assert.equal(options[1].label, "Account 2")
     assert.equal(options[1].value, "Claude Code-credentials-b28bbb7c")
   })
 
-  it("marks the active account in its hint", () => {
-    const options = buildSelectOptions(
+  it("marks the active account in its description", () => {
+    const options = helpers.buildAccountOptions(
       accounts,
       "Claude Code-credentials-b28bbb7c",
     )
-    assert.equal(options[1].hint, "active")
-    assert.equal(options[0].hint, undefined)
-    assert.equal(options[2].hint, undefined)
-  })
-
-  it("shows no prompts when only one account exists", () => {
-    const single = [accounts[0]]
-    const prompts =
-      single.length > 1 ? buildSelectOptions(single, single[0].source) : []
-    assert.deepEqual(prompts, [])
-  })
-
-  it("shows prompts when multiple accounts exist", () => {
-    const prompts =
-      accounts.length > 1
-        ? buildSelectOptions(accounts, accounts[0].source)
-        : []
-    assert.equal(prompts.length, 3)
-  })
-})
-
-describe("auth hook — authorize callback", () => {
-  it("returns url as empty string", () => {
-    assert.equal(buildAuthorizeResult(accounts[0]).url, "")
-  })
-
-  it("returns method: auto", () => {
-    assert.equal(buildAuthorizeResult(accounts[0]).method, "auto")
-  })
-
-  it("instructions mention the chosen account label", () => {
-    assert.ok(
-      buildAuthorizeResult(accounts[1]).instructions.includes("Account 2"),
-    )
-  })
-
-  it("callback returns type: success", async () => {
-    assert.equal(
-      (await buildAuthorizeResult(accounts[0]).callback()).type,
-      "success",
-    )
-  })
-
-  it("callback returns provider: anthropic", async () => {
-    assert.equal(
-      (await buildAuthorizeResult(accounts[0]).callback()).provider,
-      "anthropic",
-    )
-  })
-
-  it("callback returns the account's access token", async () => {
-    assert.equal(
-      (await buildAuthorizeResult(accounts[1]).callback()).access,
-      "at-2",
-    )
-  })
-
-  it("callback returns the account's refresh token", async () => {
-    const account = {
-      label: "Account 1",
-      source: "Claude Code-credentials",
-      credentials: makeCreds({ refreshToken: "rt-specific" }),
-    }
-    assert.equal(
-      (await buildAuthorizeResult(account).callback()).refresh,
-      "rt-specific",
-    )
-  })
-
-  it("callback returns the account's expiry timestamp", async () => {
-    const account = {
-      label: "Account 1",
-      source: "Claude Code-credentials",
-      credentials: makeCreds({ expiresAt: 1700000000000 }),
-    }
-    assert.equal(
-      (await buildAuthorizeResult(account).callback()).expires,
-      1700000000000,
-    )
+    assert.ok(options[1].description?.includes("(active)"))
+    assert.ok(!options[0].description?.includes("(active)"))
+    assert.ok(!options[2].description?.includes("(active)"))
   })
 })
 
@@ -2265,45 +2132,6 @@ describe("startup account selection — uses persisted source", () => {
         .credentials.accessToken,
       "at-2",
     )
-  })
-})
-
-describe("authorize() — immediate syncAuthJson + saveAccountSource", () => {
-  const tmp = join(tmpdir(), `opencode-authorize-test-${process.pid}`)
-
-  it("auth.json reflects the chosen account immediately after authorize()", () => {
-    mkdirSync(tmp, { recursive: true })
-    const authPath = join(tmp, "auth.json")
-    const stateFile = join(tmp, "claude-account-source.txt")
-
-    const chosen = accounts[1] // Account 2
-    syncToPath(authPath, chosen.credentials, realFs)
-    saveAccountSourceTo(stateFile, chosen.source)
-
-    const written = JSON.parse(readFileSync(authPath, "utf-8"))
-    assert.equal(written.anthropic.access, "at-2")
-    assert.equal(
-      loadPersistedAccountSourceFrom(stateFile),
-      "Claude Code-credentials-b28bbb7c",
-    )
-
-    rmSync(tmp, { recursive: true, force: true })
-  })
-
-  it("a subsequent startup restores the account written by authorize()", () => {
-    mkdirSync(tmp, { recursive: true })
-    const stateFile = join(tmp, "claude-account-source.txt")
-
-    saveAccountSourceTo(stateFile, "Claude Code-credentials-abc123")
-
-    const restored = resolveStartupAccount(
-      accounts,
-      loadPersistedAccountSourceFrom(stateFile),
-    )
-    assert.equal(restored.label, "Account 3")
-    assert.equal(restored.credentials.accessToken, "at-3")
-
-    rmSync(tmp, { recursive: true, force: true })
   })
 })
 

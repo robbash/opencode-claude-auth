@@ -12,7 +12,9 @@ Before installing, verify you have OpenCode and Claude Code installed and authen
 opencode --version
 ```
 
-You should see a version number (e.g., `1.2.28`).
+You should see a version number. **This plugin requires OpenCode v2** (version
+`2.x`). If `opencode --version` reports `1.x`, either upgrade OpenCode or pin the
+previous plugin major instead: `"plugin": ["opencode-claude-auth@1"]`.
 
 ### Check Claude Code credentials (macOS)
 
@@ -46,11 +48,12 @@ This will prompt you to log in and store credentials in Keychain (macOS) or `~/.
 
 Edit the OpenCode configuration file at `~/.config/opencode/opencode.json`.
 
-Add `opencode-claude-auth@latest` to the `plugin` array:
+Add `opencode-claude-auth@latest` to the `plugins` array. Note the key is
+`plugins` (plural) in OpenCode v2 — v1 used `plugin`:
 
 ```json
 {
-  "plugin": ["opencode-claude-auth@latest"]
+  "plugins": ["opencode-claude-auth@latest"]
 }
 ```
 
@@ -60,14 +63,15 @@ Or run this command to do it automatically:
 node -e "
 const fs = require('fs'), p = require('path').join(require('os').homedir(), '.config/opencode/opencode.json');
 const c = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p,'utf8')) : {};
-c.plugin = [...new Set([...(Array.isArray(c.plugin) ? c.plugin : []), 'opencode-claude-auth@latest'])];
+c.plugins = [...new Set([...(Array.isArray(c.plugins) ? c.plugins : []), 'opencode-claude-auth@latest'])];
+delete c.plugin;
 fs.mkdirSync(require('path').dirname(p), {recursive:true});
 fs.writeFileSync(p, JSON.stringify(c, null, 2));
 console.log('Added opencode-claude-auth@latest to', p);
 "
 ```
 
-The `@latest` tag ensures OpenCode always pulls the newest version on startup. No manual `npm install` is needed — OpenCode [automatically installs npm plugins using Bun at startup](https://opencode.ai/docs/plugins/#how-plugins-are-installed).
+The `@latest` tag ensures OpenCode always pulls the newest version on startup. No manual `npm install` is needed — OpenCode installs npm plugins at startup.
 
 ### Step 2: Verification
 
@@ -77,9 +81,14 @@ Verify the plugin was added:
 cat ~/.config/opencode/opencode.json
 ```
 
-You should see `opencode-claude-auth@latest` in the `plugin` array.
+You should see `opencode-claude-auth@latest` in the `plugins` array.
 
 ## Upgrading
+
+Coming from plugin 2.x, two config changes are required:
+
+1. Rename `plugin` to `plugins`.
+2. Make sure OpenCode itself is on v2.
 
 If you previously installed `opencode-claude-auth` without the `@latest` tag, update your config to use `opencode-claude-auth@latest` as shown above.
 

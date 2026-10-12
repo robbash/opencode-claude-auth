@@ -11,9 +11,34 @@ import {
   initAccounts,
   setActiveAccountSource,
 } from "../dist/credentials.js"
-import { buildRequestHeaders, fetchWithRetry } from "../dist/index.js"
+import { buildRequestHeaders } from "../dist/index.js"
 import { readAllClaudeAccounts } from "../dist/keychain.js"
 import { SYSTEM_IDENTITY } from "../dist/transforms.js"
+
+/**
+ * Retry on 429/529 with backoff.
+ *
+ * The plugin itself no longer issues requests — under the OpenCode v2 API it
+ * only returns a decision from `ctx.session.hook("retry")`, and OpenCode
+ * performs the attempt. This smoke tester drives the API directly, so it owns
+ * its own retry loop.
+ */
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  retries = 3,
+): Promise<Response> {
+  let response = await fetch(url, init)
+  for (let attempt = 1; attempt < retries; attempt++) {
+    if (response.status !== 429 && response.status !== 529) return response
+    const retryAfter = parseInt(response.headers.get("retry-after") ?? "", 10)
+    const delay = Number.isNaN(retryAfter) ? attempt * 2000 : retryAfter * 1000
+    if (delay > 30_000) return response
+    await new Promise((resolve) => setTimeout(resolve, delay))
+    response = await fetch(url, init)
+  }
+  return response
+}
 
 // ANSI color helpers
 const c = {
@@ -55,30 +80,26 @@ interface SkippedModel {
 }
 
 async function discoverModels(): Promise<string[]> {
-  const { createOpencode } = await import("@opencode-ai/sdk")
+  const { OpenCode } = await import("@opencode/sdk")
 
-  console.log(c.dim("Starting OpenCode server to discover models..."))
+  console.log(c.dim("Starting OpenCode to discover models..."))
 
-  const { client, server } = await createOpencode({ port: 0, timeout: 15000 })
+  const sdk = await OpenCode.create()
 
   try {
-    const res = await client.provider.list()
-    if (!res.data) {
-      throw new Error("No data returned from provider.list()")
+    const all = await sdk.model.list()
+    const models = all.data
+      .filter((model) => model.providerID === "anthropic")
+      .map((model) => model.id)
+
+    if (models.length === 0) {
+      throw new Error("No anthropic models found")
     }
 
-    const anthropic = res.data.all.find(
-      (p: { id: string }) => p.id === "anthropic",
-    )
-    if (!anthropic) {
-      throw new Error("Anthropic provider not found")
-    }
-
-    const models = Object.keys(anthropic.models)
     console.log(c.dim(`Found ${models.length} Anthropic models\n`))
     return models
   } finally {
-    server.close()
+    await sdk.close()
   }
 }
 

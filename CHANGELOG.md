@@ -1,5 +1,32 @@
 # Changelog
 
+## [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/compare/v2.2.1...v3.0.0)
+
+Migrated to the OpenCode v2 plugin API. **This release does not run on OpenCode 1.x** —
+pin `opencode-claude-auth@2` if you are still on OpenCode v1.
+
+### ⚠ BREAKING CHANGES
+
+* Requires OpenCode v2 and peer dependency `@opencode/plugin` `^2.0.0` (was `@opencode-ai/plugin`)
+* Config key `plugin` is now `plugins`
+* The package now has a single entrypoint (`.`). The `./server`, `./claude-auth-plugin` and `./opencode-claude-auth` export aliases were removed
+* Removed the exported `ClaudeAuthPlugin` named export; added `decideRetry`, `parseRetryAfterMs`, `parseModelId`, `recoverRejectedToken`, `pickUpRotatedToken`, `resolveAccount` and `buildAccountOptions`
+
+### Features
+
+* Account switching is now an OAuth method form on the `anthropic` integration instead of `opencode auth login` prompts
+* The Claude Code identity prompt is injected for every request kind (`context`, `compaction`, `generate`, `title`), not just the main chat loop
+* Model cost is zeroed through `ctx.model.transform`
+* Keychain entries annotated with a comment surface that name in the account label
+
+### Internal
+
+* `auth.loader` + custom `fetch` replaced by `ctx.session.hook("http.request")` and `ctx.session.hook("http.response")`
+* Inline 401 and long-context retry loops replaced by `ctx.session.hook("retry")`; `retry-after` is captured from the response and bridged to the retry decision. The credential recovery those loops performed is retained as `recoverRejectedToken` / `pickUpRotatedToken`, applied to the retry decision
+* `experimental.chat.system.transform` replaced by `ctx.session.hook` on each request kind
+* The integration's `refresh` callback is now the pull path for credentials. The 5-minute background `auth.json` sync is retained alongside it, so a token that expires while OpenCode is idle is still refreshed ahead of time
+* A v2 `http.request` hook cannot synthesise a response, so a refresh rate-limit that outlasts `getCredentialsWithBackoff` now surfaces as an error rather than a 429 the AI SDK would retry
+
 ## [2.2.1](https://github.com/griffinmartin/opencode-claude-auth/compare/v2.2.0...v2.2.1) (2026-09-22)
 
 
